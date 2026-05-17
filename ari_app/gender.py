@@ -1,4 +1,4 @@
-"""Estimate caller pitch from phone audio to pick male/female TTS + LLM persona."""
+"""Estimate caller pitch from phone audio (male/female hint when confident)."""
 
 from __future__ import annotations
 
@@ -79,6 +79,42 @@ def pitch_to_gender(
     return None
 
 
+def classify_pitch_history(
+    history: list[float],
+    *,
+    female_min_hz: float,
+    male_max_hz: float,
+    min_confident_samples: int = 4,
+    confident_fraction: float = 0.75,
+) -> tuple[str | None, bool, float]:
+    """
+    Returns (gender guess, is_confident, confidence_score).
+
+    Confident only when enough samples and most agree in clear male or female band.
+    """
+    if not history:
+        return None, False, 0.0
+    n = len(history)
+    if n < min_confident_samples:
+        return None, False, 0.0
+
+    male_n = sum(1 for p in history if p <= male_max_hz)
+    female_n = sum(1 for p in history if p >= female_min_hz)
+    male_frac = male_n / n
+    female_frac = female_n / n
+
+    if male_frac >= confident_fraction and male_n >= min_confident_samples:
+        return "male", True, male_frac
+    if female_frac >= confident_fraction and female_n >= min_confident_samples:
+        return "female", True, female_frac
+
+    median = float(np.median(history))
+    tentative = pitch_to_gender(
+        median, female_min_hz=female_min_hz, male_max_hz=male_max_hz
+    )
+    return tentative, False, max(male_frac, female_frac)
+
+
 def merge_gender_estimate(
     current: str | None,
     pitch_hz: float | None,
@@ -86,21 +122,47 @@ def merge_gender_estimate(
     female_min_hz: float,
     male_max_hz: float,
     min_samples: int = 2,
+    min_confident_samples: int = 4,
+    confident_fraction: float = 0.75,
     pitch_history: list[float] | None = None,
-) -> tuple[str | None, list[float]]:
-    """Sticky gender from median pitch over recent utterances."""
+    lock_after_set: bool = True,
+) -> tuple[str | None, list[float], bool]:
+    """
+    Update pitch history; set caller gender only when confident.
+
+    Returns (gender, history, caller_gender_confident).
+    Once confident, gender is locked for the call (lock_after_set).
+    """
     history = list(pitch_history or [])
     if pitch_hz is not None and pitch_hz > 0:
         history.append(pitch_hz)
-        history = history[-5:]
+        history = history[-10:]
+
+    if (
+        lock_after_set
+        and current in ("male", "female")
+        and len(history) >= min_confident_samples
+    ):
+        return current, history, True
 
     if len(history) < min_samples:
-        return current, history
+        return current, history, False
 
-    median = float(np.median(history))
-    guess = pitch_to_gender(
-        median, female_min_hz=female_min_hz, male_max_hz=male_max_hz
+    guess, confident, score = classify_pitch_history(
+        history,
+        female_min_hz=female_min_hz,
+        male_max_hz=male_max_hz,
+        min_confident_samples=min_confident_samples,
+        confident_fraction=confident_fraction,
     )
-    if guess is None:
-        return current, history
-    return guess, history
+    if confident and guess:
+        log.debug(
+            "pitch gender confident: %s (median=%.0fHz n=%s score=%.2f)",
+            guess,
+            float(np.median(history)),
+            len(history),
+            score,
+        )
+        return guess, history, True
+
+    return current, history, False

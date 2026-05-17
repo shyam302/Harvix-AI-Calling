@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -86,6 +87,108 @@ def warmup_supertonic(
             _get_voice_style(engine, name.strip())
 
 
+def _probe_sample_rate(wav_path: Path) -> int | None:
+    try:
+        proc = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "a:0",
+                "-show_entries",
+                "stream=sample_rate",
+                "-of",
+                "csv=p=0",
+                str(wav_path),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if proc.returncode == 0 and proc.stdout.strip().isdigit():
+            return int(proc.stdout.strip())
+    except OSError:
+        pass
+    return None
+
+
+def _clamp_speed(speed: float, *, lang: str | None = None) -> float:
+    """Allow modest speed-up via SUPERTONIC_SPEED_* (capped to avoid chipmunk on 8 kHz)."""
+    s = float(speed)
+    if lang == "hi":
+        return max(0.90, min(s, 1.12))
+    return max(0.90, min(s, 1.15))
+
+
+def _telephony_af_chain(*, tail_pad_s: float = 0.0) -> str:
+    """
+    Clean 8 kHz mono for Asterisk.
+
+    - Band-limit like a phone line (reduces harsh / alien highs).
+    - soxr resample without async= (async time-stretch causes fast chipmunk tails).
+  """
+    parts = [
+        "highpass=f=100",
+        "lowpass=f=3400",
+        "aresample=8000:resampler=soxr:precision=28:cutoff=0.96",
+    ]
+    if tail_pad_s > 0:
+        parts.append(f"apad=pad_dur={tail_pad_s:.2f}")
+    return ",".join(parts)
+
+
+def _run_ffmpeg(cmd: list[str]) -> None:
+    proc = subprocess.run(cmd, capture_output=True, check=False)
+    if proc.returncode != 0:
+        err = (proc.stderr or b"").decode(errors="replace")[-800:]
+        raise RuntimeError(f"ffmpeg failed ({proc.returncode}): {err}")
+
+
+def _ffmpeg_to_asterisk_wav(
+    src: Path, dst: Path, *, tail_pad_s: float = 0.0
+) -> None:
+    """Convert Supertonic WAV to standard 8 kHz 16-bit mono PCM for Asterisk."""
+    sr = _probe_sample_rate(src)
+    if sr:
+        log.debug("TTS source sample_rate=%s Hz -> 8000 Hz", sr)
+
+    af = _telephony_af_chain(tail_pad_s=tail_pad_s)
+    try:
+        _run_ffmpeg(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(src),
+                "-af",
+                af,
+                "-ac",
+                "1",
+                "-c:a",
+                "pcm_s16le",
+                str(dst),
+            ]
+        )
+    except RuntimeError:
+        # Fallback without soxr / band-limit
+        _run_ffmpeg(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(src),
+                "-ar",
+                "8000",
+                "-ac",
+                "1",
+                "-c:a",
+                "pcm_s16le",
+                str(dst),
+            ]
+        )
+
+
 def _synthesize_sync(
     text: str,
     out_wav: Path,
@@ -94,6 +197,7 @@ def _synthesize_sync(
     lang: str,
     speed: float,
     silence_duration: float,
+    tail_pad_s: float = 0.0,
 ) -> None:
     plain = _tts_plain_text(text)
     if not plain:
@@ -102,10 +206,14 @@ def _synthesize_sync(
     engine = _ensure_engine()
     style = _get_voice_style(engine, voice_name)
 
+    use_speed = _clamp_speed(speed, lang=lang)
+    use_silence = max(0.12, min(float(silence_duration), 0.22))
+
     log.info(
-        "Supertonic synthesizing lang=%s voice=%s chars=%s preview=%r",
+        "Supertonic synthesizing lang=%s voice=%s speed=%.2f chars=%s preview=%r",
         lang,
         voice_name,
+        use_speed,
         len(plain),
         plain[:60],
     )
@@ -114,41 +222,67 @@ def _synthesize_sync(
         plain,
         voice_style=style,
         lang=lang,
-        speed=speed,
-        silence_duration=silence_duration,
+        speed=use_speed,
+        silence_duration=use_silence,
     )
-    log.info("Supertonic synthesize finished in %.1fs", time.perf_counter() - t0)
+    log.info(
+        "Supertonic done in %.1fs speed=%.2f silence=%.2fs",
+        time.perf_counter() - t0,
+        use_speed,
+        use_silence,
+    )
 
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
         raw_wav = Path(tmp.name)
     try:
         engine.save_audio(wav, str(raw_wav))
-        _ffmpeg_to_asterisk_wav(raw_wav, out_wav)
+        _ffmpeg_to_asterisk_wav(raw_wav, out_wav, tail_pad_s=tail_pad_s)
         log.info("Supertonic WAV ready for Asterisk: %s", out_wav)
     finally:
         raw_wav.unlink(missing_ok=True)
 
 
-def _ffmpeg_to_asterisk_wav(src: Path, dst: Path) -> None:
-    proc = subprocess.run(
-        [
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(src),
-            "-ar",
-            "8000",
-            "-ac",
-            "1",
-            "-c:a",
-            "pcm_s16le",
-            str(dst),
-        ],
-        capture_output=True,
-        check=False,
-    )
-    if proc.returncode != 0:
-        raise RuntimeError(f"ffmpeg TTS post-process failed: {proc.returncode}")
+def concat_asterisk_wavs(
+    parts: list[Path], dst: Path, *, tail_pad_s: float = 0.0
+) -> None:
+    """Merge chunks and apply one telephony pass (smooth, no boundary artifacts)."""
+    parts = [p for p in parts if p.is_file()]
+    if not parts:
+        raise ValueError("no WAV parts to concat")
+    if len(parts) == 1:
+        _ffmpeg_to_asterisk_wav(parts[0], dst, tail_pad_s=tail_pad_s)
+        return
+
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".txt", delete=False, encoding="utf-8"
+    ) as manifest:
+        for p in parts:
+            manifest.write(f"file '{p.resolve()}'\n")
+        manifest_path = Path(manifest.name)
+
+    af = _telephony_af_chain(tail_pad_s=tail_pad_s)
+    try:
+        _run_ffmpeg(
+            [
+                "ffmpeg",
+                "-y",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                str(manifest_path),
+                "-af",
+                af,
+                "-ac",
+                "1",
+                "-c:a",
+                "pcm_s16le",
+                str(dst),
+            ]
+        )
+    finally:
+        manifest_path.unlink(missing_ok=True)
 
 
 def speed_for_lang(
@@ -171,10 +305,11 @@ async def synthesize_to_wav(
     *,
     voice_en: str,
     voice_hi: str = "",
-    speed: float = 1.05,
+    speed: float = 1.0,
     speed_en: float | None = None,
     speed_hi: float | None = None,
-    silence_duration: float = 0.12,
+    silence_duration: float = 0.18,
+    tail_pad_s: float = 0.0,
     session_lang: str | None = None,
     lang: str | None = None,
     voice_name: str | None = None,
@@ -204,5 +339,6 @@ async def synthesize_to_wav(
             lang=resolved_lang,
             speed=resolved_speed,
             silence_duration=silence_duration,
+            tail_pad_s=tail_pad_s,
         ),
     )

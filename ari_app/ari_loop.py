@@ -73,6 +73,18 @@ async def run_ari_forever() -> None:
                 dialed_number=dialed,
                 max_messages=settings.session_max_messages,
                 primary_lang=settings.call_primary_lang,
+                gender_detect_caller=settings.gender_detect_caller,
+                gender_adapt_when_confident=settings.gender_adapt_when_confident
+                or settings.gender_mirror_grammar,
+                gender_mirror_caller=settings.gender_mirror_caller,
+                gender_mirror_grammar=settings.gender_mirror_grammar,
+                gender_min_confident_samples=settings.gender_min_confident_samples,
+                gender_confident_fraction=settings.gender_confident_fraction,
+                agent_gender=settings.agent_gender,
+                agent_voice_gender=settings.agent_voice_gender,
+                grammar_match_voice=settings.grammar_match_voice,
+                gender_grammar_until_confident=settings.gender_grammar_until_confident,
+                gender_grammar_min_turns=settings.gender_grammar_min_turns,
             )
             registry.register(ctx)
             session = CallSession(

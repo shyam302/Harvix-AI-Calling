@@ -104,7 +104,7 @@ Recommended speech / language block:
     SUPERTONIC_SPEED_EN=1.22
 
     CALL_PRIMARY_LANG=hi
-    OPENING_GREETING=नमस्ते, बताइए मैं क्या मदद कर सकती हूँ?
+    OPENING_GREETING=Hi, how can I help you today?
 
 Turn-taking (tune for natural phone feel):
 
