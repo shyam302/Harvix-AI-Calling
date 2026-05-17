@@ -106,4 +106,4 @@ tts/                  Supertonic demo script
 
 ## License
 
-Specify a license (e.g. MIT) when you publish. No license file is included yet.
+This project is licensed under the [MIT License](LICENSE).
