@@ -2,7 +2,7 @@
 
 Open-source **voice call assistant** for Asterisk: callers dial a SIP extension and talk to an AI that listens, thinks, and speaks back in natural Hindi or English.
 
-Built with **Asterisk ARI**, **faster-whisper**, **vLLM** (or any OpenAI-compatible API), and **Supertonic** (local neural TTS — no cloud TTS required).
+Built with [**Asterisk**](https://www.asterisk.org/) ARI, **faster-whisper**, [**vLLM**](https://vllm.ai/) (or any OpenAI-compatible API), and [**Supertonic**](https://github.com/supertone-inc/supertonic) (local neural TTS — no cloud TTS required).
 
 ```
 SIP phone → Asterisk → Python (ARI) → Whisper → LLM → Supertonic → play audio on call
@@ -21,11 +21,19 @@ SIP phone → Asterisk → Python (ARI) → Whisper → LLM → Supertonic → p
 
 | Layer | Technology |
 |-------|------------|
-| Telephony | Asterisk 22.x, PJSIP, Stasis app `callbot` |
-| Orchestration | Python 3.11, FastAPI + uvicorn, ARI WebSocket |
+| Telephony | [Asterisk](https://www.asterisk.org/) 22.x, PJSIP, Stasis app `callbot` — [docs](https://docs.asterisk.org/) |
+| Orchestration | Python 3.11, FastAPI + uvicorn, [ARI](https://docs.asterisk.org/Configuration/Interfaces/ARI/) WebSocket |
 | Speech-to-text | [faster-whisper](https://github.com/SYSTRAN/faster-whisper) |
-| LLM | vLLM / Ollama / OpenAI-compatible HTTP API |
-| Text-to-speech | [Supertonic](https://github.com/supertone-inc/supertonic) |
+| LLM | [vLLM](https://vllm.ai/) — [documentation](https://docs.vllm.ai/) · Ollama / OpenAI-compatible API |
+| Text-to-speech | [Supertonic](https://github.com/supertone-inc/supertonic) — [Supertone](https://www.supertone.ai/) · [Hugging Face](https://huggingface.co/Supertone/supertonic) |
+
+## Official project links
+
+| Project | Website | Docs / code |
+|---------|---------|-------------|
+| **Asterisk** | [asterisk.org](https://www.asterisk.org/) | [docs.asterisk.org](https://docs.asterisk.org/) |
+| **vLLM** | [vllm.ai](https://vllm.ai/) | [docs.vllm.ai](https://docs.vllm.ai/) · [GitHub](https://github.com/vllm-project/vllm) |
+| **Supertonic** | [supertone.ai](https://www.supertone.ai/) (Supertone) | [GitHub](https://github.com/supertone-inc/supertonic) · [Hugging Face](https://huggingface.co/Supertone/supertonic) |
 
 ## Requirements
 
