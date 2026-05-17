@@ -1,4 +1,4 @@
-# Harvix AI Calling
+# 🚀 100% Free & Open-Source AI Calling Platform
 
 Open-source **voice call assistant** for Asterisk: callers dial a SIP extension and talk to an AI that listens, thinks, and speaks back in natural Hindi or English.
 
