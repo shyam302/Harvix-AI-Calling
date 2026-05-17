@@ -1,0 +1,29 @@
+Fix: Python ARI "Connect call failed ... 8088" (errno 111 = connection refused)
+================================================================================
+
+Asterisk only opens the ARI WebSocket port after the built-in HTTP server is enabled.
+
+1) Edit /etc/asterisk/http.conf in [general]:
+   - Change the line ";enabled=yes" to:
+       enabled=yes
+     (remove the leading semicolon)
+
+   - Keep bindaddr and bindport, e.g.:
+       bindaddr=127.0.0.1
+       bindport=8088
+
+2) Apply http.conf (there is no module named res_http.so on typical installs).
+   Use one of:
+     sudo asterisk -rx "core reload"
+   or:
+     sudo systemctl restart asterisk
+   Optional: see how HTTP is exposed on your build:
+     sudo asterisk -rx "module show like http"
+   If you see http.so listed, you can use: sudo asterisk -rx "module reload http.so"
+
+3) Verify:
+     sudo asterisk -rx "http show status"
+   Expect "Enabled: Yes" and Server Enabled / Bound address including 8088.
+
+4) Quick one-liner (Ubuntu/Debian default http.conf only if the line is still commented):
+     sudo sed -i 's/^;enabled=yes/enabled=yes/' /etc/asterisk/http.conf && sudo systemctl restart asterisk
