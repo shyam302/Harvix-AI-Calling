@@ -1,58 +1,64 @@
-Asterisk Callbot — installation guide (public / self-hosted)
-============================================================
+Harvix AI Calling — installation guide
+======================================
 
-This document is for anyone cloning this repository. It does not contain secrets.
-Copy `.env.example` to `.env` and set your own passwords and URLs.
+Public repository: https://github.com/shyam302/Harvix-AI-Calling
 
-See also: README.md (overview), ARCHITECTURE.md (design), .env.example (all variables).
+This guide is for self-hosted deployment. It does not contain secrets.
+Copy .env.example to .env and set your own passwords and URLs.
+
+Related docs:
+  README.md         — overview and quick start
+  ARCHITECTURE.md   — system design and call flow
+  .env.example      — all configuration variables
 
 
 What you are building
 ---------------------
   SIP phone  →  Asterisk (PJSIP + dialplan)  →  Stasis app "callbot"
                     ↓
-  Python app (this repo) over ARI WebSocket:
-    record audio → Whisper STT → vLLM chat → Supertonic TTS → play WAV
+  Python app (Harvix AI Calling) over ARI WebSocket:
+    record → Whisper STT → vLLM → Supertonic TTS → play 8 kHz WAV on call
 
-Default example in shipped snippets (change before production):
-  SIP extension 1001 / password in pjsip snippet
+  Stack: Asterisk ARI + faster-whisper + vLLM (OpenAI-compatible) + Supertonic (local ONNX).
+
+Example defaults in asterisk_snippets/ (change before production):
+  SIP user 1001 / password in pjsip snippet
   Dial 7001 to reach the bot
   ARI user callbot — password must match .env ARI_PASSWORD
 
 
 Prerequisites
 -------------
-  - Linux with Asterisk (Debian/Ubuntu packages or official builds)
+  - Linux with Asterisk 18+ (22.x tested)
   - Python 3.11+ (venv or conda)
-  - ffmpeg on PATH
-  - OpenAI-compatible LLM server (vLLM, etc.) reachable from the Python host
-  - GPU optional but recommended for Whisper; Supertonic TTS uses local ONNX (CPU OK)
-  - One-time internet for pip install and first model download (~/.cache/supertonic3/, Whisper cache)
+  - ffmpeg on PATH (STT resample + Supertonic → Asterisk WAV)
+  - OpenAI-compatible LLM (vLLM, Ollama, etc.) reachable from the Python host
+  - GPU recommended for Whisper (e.g. large-v3); Supertonic TTS runs on CPU via ONNX
+  - One-time internet: pip install, ~/.cache/supertonic3/, Whisper model download
+  - No Microsoft edge-tts or other cloud TTS API required after models are cached
 
 
-Security before you go public or production
--------------------------------------------
-  1. Never commit .env (already in .gitignore).
-  2. Replace ALL default passwords in asterisk_snippets/ before deploying.
-  3. Bind ARI HTTP to 127.0.0.1 in http.conf unless the Python app runs on another host
-     you trust on the network.
-  4. Firewall: SIP UDP 5060, RTP UDP 10000-20000 (see your rtp.conf), do not expose ARI
-     to the internet without TLS and auth review.
-  5. Use a private GitHub repo if snippets still contain lab credentials during testing.
+Security (read before production)
+---------------------------------
+  1. Never commit .env (listed in .gitignore).
+  2. Replace ALL example passwords in asterisk_snippets/.
+  3. Bind ARI HTTP to 127.0.0.1 in http.conf unless the bot runs on a trusted host.
+  4. Firewall: SIP UDP 5060, RTP UDP 10000-20000; do not expose ARI to the public internet.
+  5. Use a private GitHub repo while testing if snippets still have lab passwords.
 
 
-STEP 0 — Clone and set project directory
-----------------------------------------
+STEP 0 — Clone the repository
+-----------------------------
 
-    git clone https://github.com/YOUR_ORG/Asterisk_Call.git
+    git clone https://github.com/shyam302/Harvix-AI-Calling.git
+    cd Harvix-AI-Calling
     export ACALL_ROOT="$(pwd)"
-    cd "$ACALL_ROOT"
 
 
 STEP 1 — Python environment
 ---------------------------
 
-Using venv (any OS):
+Using venv:
 
     python3 -m venv .venv
     source .venv/bin/activate
@@ -61,91 +67,116 @@ Using venv (any OS):
 
 Using conda (optional):
 
-    conda create -n callbot python=3.11 -y
-    conda activate callbot
+    conda create -n harvix-call python=3.11 -y
+    conda activate harvix-call
     pip install -r requirements.txt
 
 Verify ffmpeg:
 
     ffmpeg -version
 
-Optional — test Supertonic (downloads models on first run):
+Test Supertonic locally (downloads ONNX on first run):
 
     python tts/supertonic_demo.py
 
 
-STEP 2 — Application configuration (.env)
------------------------------------------
+STEP 2 — Configure .env
+-----------------------
 
     cp .env.example .env
 
-Edit .env. Minimum required:
+Minimum settings:
 
-    ARI_PASSWORD=<strong-secret-matching-asterisk-ari-user>
+    ARI_PASSWORD=<match ari_user_callbot.conf>
     VLLM_BASE_URL=http://<llm-host>:8000/v1
-    VLLM_MODEL=<model-id-your-server-exposes>
+    VLLM_MODEL=<model-id-from-your-llm-server>
 
-Match ARI_USERNAME / ARI_PASSWORD to the stanza in asterisk_snippets/ari_user_callbot.conf
-(section name = username).
+Recommended speech / language block:
 
-Supertonic (local TTS) — documented in .env.example:
+    WHISPER_MODEL=large-v3
+    WHISPER_DEVICE=cuda
+    WHISPER_COMPUTE_TYPE=float16
+    WHISPER_LANGUAGE=auto
 
     SUPERTONIC_VOICE_FEMALE=F3
     SUPERTONIC_VOICE_MALE=M1
-    SUPERTONIC_SPEED_EN=1.22
     SUPERTONIC_SPEED_HI=1.08
+    SUPERTONIC_SPEED_EN=1.22
 
-First start of python -m ari_app.server downloads ONNX weights to ~/.cache/supertonic3/.
+    CALL_PRIMARY_LANG=hi
+    OPENING_GREETING=नमस्ते, बताइए मैं क्या मदद कर सकती हूँ?
+
+Turn-taking (tune for natural phone feel):
+
+    RECORD_MAX_SILENCE_SECONDS=1.2
+    PAUSE_AFTER_TTS_MS=350
+    PAUSE_BEFORE_LISTEN_MS=450
+    PAUSE_BEFORE_RESPONSE_MS=400
+
+Language switching:
+
+    LANG_SWITCH_MIN_EN_WORDS=3
+    LANG_SWITCH_CONSECUTIVE_EN=1
+    Saying "continue", "speak english", or a clear English sentence switches to English.
+
+Gender-matched voice (optional):
+
+    GENDER_PITCH_FEMALE_MIN_HZ=165
+    GENDER_PITCH_MALE_MAX_HZ=155
+    GENDER_MIN_PITCH_SAMPLES=2
+
+First run of python -m ari_app.server preloads Supertonic + Whisper (may take a few minutes).
 
 
-STEP 3 — Install Asterisk snippet configs
----------------------------------------
+STEP 3 — Install Asterisk snippets
+--------------------------------
 
     sudo cp "$ACALL_ROOT/asterisk_snippets/ari_user_callbot.conf" /etc/asterisk/
     sudo cp "$ACALL_ROOT/asterisk_snippets/pjsip_lan_callbot.conf" /etc/asterisk/
     sudo cp "$ACALL_ROOT/asterisk_snippets/extensions_callbot.conf" /etc/asterisk/
 
-Edit copied files: change SIP passwords, and set external_media_address /
-external_signaling_address to your Asterisk server's real IP if phones are not on
-the same host (required for RTP audio — see troubleshooting).
+Edit the copied files:
+  - Change SIP passwords
+  - Set external_media_address and external_signaling_address on [transport-udp]
+    to the Asterisk host IP that phones use (required for inbound audio / NAT)
 
-Add includes to main configs if not present:
+Add to main Asterisk configs:
 
-    # In /etc/asterisk/ari.conf
+    # /etc/asterisk/ari.conf
     #include ari_user_callbot.conf
 
-    # In /etc/asterisk/pjsip.conf
+    # /etc/asterisk/pjsip.conf
     #include pjsip_lan_callbot.conf
 
-    # In /etc/asterisk/extensions.conf
+    # /etc/asterisk/extensions.conf
     #include extensions_callbot.conf
 
 
 STEP 4 — Enable Asterisk HTTP (ARI)
 -----------------------------------
 
-/etc/asterisk/http.conf — [general] must include:
+/etc/asterisk/http.conf — [general]:
 
     enabled=yes
     bindaddr=127.0.0.1
     bindport=8088
 
-Reload or restart Asterisk after changes.
+Restart or reload Asterisk after editing.
 
 
 STEP 5 — Writable directories
 -----------------------------
 
-TTS playback files (Linux user running the Python app must write here):
+Supertonic output is written here for playback (sound:custom/...):
 
     sudo mkdir -p /var/lib/asterisk/sounds/en/custom
     sudo chown root:asterisk /var/lib/asterisk/sounds/en/custom
     sudo chmod 2775 /var/lib/asterisk/sounds/en/custom
     sudo usermod -aG asterisk YOUR_LINUX_USER
 
-Log out/in after usermod. Lab-only alternative: chmod 1777 on that directory.
+Log out and back in after usermod.
 
-ARI call recordings:
+ARI recordings (inbound caller audio):
 
     sudo mkdir -p /var/spool/asterisk/recording
     sudo chown asterisk:asterisk /var/spool/asterisk/recording
@@ -153,7 +184,7 @@ ARI call recordings:
 
 
 STEP 6 — Reload Asterisk
-------------------------
+-----------------------
 
     sudo asterisk -rx "core reload"
     sudo asterisk -rx "module reload res_ari.so"
@@ -161,33 +192,32 @@ STEP 6 — Reload Asterisk
     sudo asterisk -rx "dialplan reload"
 
 
-STEP 7 — Verify Asterisk
-------------------------
+STEP 7 — Verify Asterisk and ARI
+--------------------------------
 
     sudo asterisk -rx "http show status"
     sudo asterisk -rx "pjsip show endpoints"
     sudo asterisk -rx "dialplan show from-internal-app"
 
-From the Asterisk host (replace password):
-
     curl -sS -u callbot:YOUR_ARI_PASSWORD \
       http://127.0.0.1:8088/ari/asterisk/info
 
+Expect HTTP 200.
 
-STEP 8 — Start LLM backend
---------------------------
 
-Ensure models endpoint works:
+STEP 8 — Start the LLM server
+-----------------------------
 
     curl -sS http://127.0.0.1:8000/v1/models
 
-Point VLLM_BASE_URL in .env at that server (path must end with /v1).
+Set VLLM_BASE_URL in .env to your server (URL must end with /v1).
+Remote LLM (Tailscale/LAN) is supported; increase VLLM_TIMEOUT_SECONDS if needed.
 
 
-STEP 9 — Run the callbot
-------------------------
+STEP 9 — Run Harvix AI Calling
+------------------------------
 
-    source .venv/bin/activate   # or: conda activate callbot
+    source .venv/bin/activate
     cd "$ACALL_ROOT"
     python -m ari_app.server
 
@@ -195,37 +225,66 @@ Health check:
 
     curl -sS http://127.0.0.1:8765/health
 
-Expected logs: Supertonic ready, Whisper model loaded, ARI WebSocket connected.
+Expected startup logs:
+  Loading Supertonic TTS ...
+  Supertonic TTS ready
+  Loading faster-whisper model=...
+  ARI WebSocket app=callbot ... tts=supertonic
 
 
-STEP 10 — Register a SIP client and test
-----------------------------------------
+STEP 10 — Softphone test
+------------------------
 
-Point softphone at Asterisk server IP (not 127.0.0.1 from another machine):
+    Server:     <Asterisk host LAN or Tailscale IP>  (not 127.0.0.1 from another PC)
+    Port:       5060 UDP
+    User/pass:  per pjsip snippet (example 1001)
 
-    Server: <asterisk-host-ip>
-    Port: 5060 UDP
-    User / password: per your pjsip snippet (example 1001)
-
-Dial extension 7001 (default in extensions_callbot.conf).
-
-Call flow: greeting (Supertonic) → speak → bot replies.
+Dial 7001. You should hear the opening greeting, then each turn:
+  listen → STT → LLM → Supertonic → play.
 
 
-Hindi and English
------------------
-  - WHISPER_LANGUAGE=auto and multilingual Whisper model (e.g. large-v3)
-  - CALL_PRIMARY_LANG=hi or en
-  - LLM should support your languages (e.g. Gemma for Hindi Devanagari)
-  - Saying "continue" or clear English switches to English (see LANG_SWITCH_* in .env)
-  - Hindi replies should be Devanagari for best TTS lang=hi
+Hindi and English behaviour
+---------------------------
+  - Default CALL_PRIMARY_LANG=hi keeps the call in Hindi until clear English is detected.
+  - Whisper uses session language hint (WHISPER_LANGUAGE=auto).
+  - LLM replies in Devanagari for Hindi; English for English sessions.
+  - TTS uses Supertonic lang=hi or lang=en; English playback uses SUPERTONIC_SPEED_EN (faster).
+  - Per-call history: SESSION_MAX_MESSAGES (cleared on hangup).
 
 
 Adding more SIP users
 ---------------------
-  Duplicate the three PJSIP blocks (auth, aor, endpoint) with a new extension id.
-  Same context from-internal-app so all users can dial 7001.
-  See example block in SETUP (older detailed section) or pjsip_lan_callbot.conf template.
+Each extension needs auth + aor + endpoint blocks with the same id.
+Use context=from-internal-app so all users can dial 7001.
+
+Example for extension 1003 (password MySecret3):
+
+    [1003]
+    type=auth
+    auth_type=userpass
+    username=1003
+    password=MySecret3
+
+    [1003]
+    type=aor
+    max_contacts=2
+
+    [1003]
+    type=endpoint
+    transport=transport-udp
+    context=from-internal-app
+    disallow=all
+    allow=ulaw,alaw,g722
+    auth=1003
+    aors=1003
+    direct_media=no
+    rtp_symmetric=yes
+    force_rport=yes
+    rewrite_contact=yes
+
+    sudo asterisk -rx "pjsip reload"
+
+Only one ARI user (callbot) is needed for the Python app — not one per SIP phone.
 
 
 Verification checklist
@@ -233,57 +292,72 @@ Verification checklist
 
     pip install -r requirements.txt && ffmpeg -version | head -1
     test -f .env && grep -q VLLM_BASE_URL .env
+    python tts/supertonic_demo.py
     sudo asterisk -rx "http show status"
-    curl -sS -o /dev/null -w "%{http_code}\n" -u callbot:PASSWORD http://127.0.0.1:8088/ari/asterisk/info
+    curl -sS -o /dev/null -w "%{http_code}\n" -u callbot:PASSWORD \
+      http://127.0.0.1:8088/ari/asterisk/info
     curl -sS http://127.0.0.1:8765/health
 
 
 Troubleshooting
 ---------------
 
-Connection refused port 8088:
-  Enable HTTP in http.conf; restart Asterisk.
+Connection refused on 8088:
+  Enable HTTP in http.conf; sudo systemctl restart asterisk.
 
-ARI 401:
-  ari_user_callbot.conf password must match .env ARI_PASSWORD.
+ARI HTTP 401:
+  Password in ari_user_callbot.conf must match .env ARI_PASSWORD.
 
-No inbound audio (bot always "didn't catch that"):
-  RTP/NAT — set external_media_address on PJSIP transport to server IP;
-  open UDP 10000-20000; rtp set debug on during a test call.
+Greeting OK but "didn't catch that" every turn:
+  Inbound RTP problem. Set PJSIP external_media_address to server IP.
+  Open UDP 10000-20000. During a call: sudo asterisk -rx "rtp set debug on"
+  Check recording spool permissions (STEP 5).
 
-PermissionError on sounds/en/custom:
-  Fix ownership on /var/lib/asterisk/sounds/en/custom (STEP 5).
+PermissionError on /var/lib/asterisk/sounds/en/custom:
+  Repeat STEP 5; user running python must write WAV files there.
 
-Supertonic / TTS:
-  pip install supertonic; run supertonic_demo.py; check STEP 5 permissions.
+Supertonic / playback failed sound:custom/tts-...:
+  pip install supertonic; run tts/supertonic_demo.py; fix STEP 5 permissions.
 
-vLLM timeout:
-  curl VLLM_BASE_URL/models from the same host as the Python app.
+vLLM timeout / no AI reply:
+  curl -m 10 $VLLM_BASE_URL/models from the Python host.
 
-Whisper CUDA errors:
+Language flips hi/en randomly:
+  See LANG_SWITCH_* in .env; say "continue" for immediate English.
+
+English TTS sounds slow:
+  Raise SUPERTONIC_SPEED_EN (e.g. 1.25).
+
+Whisper CUDA error (libcublas):
   conda install -c conda-forge libcublas=12
   or WHISPER_DEVICE=cpu and WHISPER_COMPUTE_TYPE=int8
 
-Tune timing in .env:
-  RECORD_MAX_SILENCE_SECONDS, PAUSE_BEFORE_LISTEN_MS, PAUSE_BEFORE_RESPONSE_MS
+
+Updating GitHub
+---------------
+After local changes:
+
+    git add SETUP.txt README.md
+    git commit -m "Update documentation"
+    git push origin main
+
+If push rejected (remote has different README history):
+
+    git push origin main --force
+
+Confirm on: https://github.com/shyam302/Harvix-AI-Calling
+  - ari_app/ and asterisk_snippets/ visible
+  - .env must NOT appear in the repo
 
 
-Repository files
-----------------
+Repository layout
+-----------------
 
-    README.md                 Project overview (GitHub front page)
-    SETUP.txt                 This file
-    ARCHITECTURE.md           Technical architecture
-    .env.example              Configuration template
-    requirements.txt          Python dependencies
-    ari_app/                  Application source
-    asterisk_snippets/        Example Asterisk configs (edit before use)
-    tts/supertonic_demo.py    Local TTS test
-
-Publishing on GitHub
---------------------
-  1. Ensure .env is not tracked: git status must not list .env
-  2. Replace YOUR_ORG in README clone URL
-  3. Add LICENSE file
-  4. Consider private repo until production passwords are removed from snippets
-  5. git add . && git commit && git remote add origin ... && git push
+    README.md
+    SETUP.txt                 (this file)
+    ARCHITECTURE.md
+    .env.example
+    requirements.txt
+    ari_app/
+    asterisk_snippets/
+    tts/supertonic_demo.py
