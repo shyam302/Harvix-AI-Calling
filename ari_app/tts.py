@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
-import shutil
 import subprocess
 import tempfile
 import threading
 import time
+import wave
 from pathlib import Path
 from typing import Any
 
@@ -121,21 +122,56 @@ def _clamp_speed(speed: float, *, lang: str | None = None) -> float:
     return max(0.90, min(s, 1.15))
 
 
-def _telephony_af_chain(*, tail_pad_s: float = 0.0) -> str:
+def _bool_env(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
+        return default
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def _int_env(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        return int(str(raw).strip())
+    except ValueError:
+        return default
+
+
+def _telephony_af_chain(*, tail_pad_s: float = 0.0, light: bool = False) -> str:
     """
     Clean 8 kHz mono for Asterisk.
 
     - Band-limit like a phone line (reduces harsh / alien highs).
-    - soxr resample without async= (async time-stretch causes fast chipmunk tails).
-  """
+    - Trim trailing near-silence + short fade-out (fixes ghost/chipmunk tail).
+    - Never use aresample=async= (causes rushed alien tails).
+    """
+    precision = 20 if light else 28
+    fade_ms = _int_env("TTS_TAIL_FADE_MS", 45)
+    fade_s = max(0.02, min(fade_ms / 1000.0, 0.10))
+
     parts = [
         "highpass=f=100",
         "lowpass=f=3400",
-        "aresample=8000:resampler=soxr:precision=28:cutoff=0.96",
+        f"aresample=8000:resampler=soxr:precision={precision}:cutoff=0.96",
     ]
+    if _bool_env("TTS_TRIM_TRAILING_SILENCE", True):
+        parts.append(
+            "silenceremove=stop_periods=-1:stop_duration=0.12:stop_threshold=-42dB"
+        )
+    parts.append(f"areverse,afade=t=in:st=0:d={fade_s:.3f},areverse")
     if tail_pad_s > 0:
         parts.append(f"apad=pad_dur={tail_pad_s:.2f}")
     return ",".join(parts)
+
+
+def _wav_pcm_info(path: Path) -> tuple[int, int, int] | None:
+    try:
+        with wave.open(str(path), "rb") as wf:
+            return wf.getframerate(), wf.getnchannels(), wf.getsampwidth()
+    except wave.Error:
+        return None
 
 
 def _run_ffmpeg(cmd: list[str]) -> None:
@@ -149,18 +185,17 @@ def _ffmpeg_to_asterisk_wav(
     src: Path, dst: Path, *, tail_pad_s: float = 0.0
 ) -> None:
     """Convert Supertonic WAV to standard 8 kHz 16-bit mono PCM for Asterisk."""
-    sr = _probe_sample_rate(src)
+    light = _bool_env("TTS_FFMPEG_LIGHT", True)
+    sr = _probe_sample_rate(src) or (_wav_pcm_info(src) or (None,))[0]
     if sr:
-        log.debug("TTS source sample_rate=%s Hz -> 8000 Hz", sr)
+        log.debug("TTS postprocess %s Hz -> 8 kHz telephony+tail (light=%s)", sr, light)
 
-    af = _telephony_af_chain(tail_pad_s=tail_pad_s)
+    af = _telephony_af_chain(tail_pad_s=tail_pad_s, light=light)
+    base_cmd = ["ffmpeg", "-y", "-nostdin", "-threads", "2", "-i", str(src)]
     try:
         _run_ffmpeg(
-            [
-                "ffmpeg",
-                "-y",
-                "-i",
-                str(src),
+            base_cmd
+            + [
                 "-af",
                 af,
                 "-ac",
@@ -171,13 +206,9 @@ def _ffmpeg_to_asterisk_wav(
             ]
         )
     except RuntimeError:
-        # Fallback without soxr / band-limit
         _run_ffmpeg(
-            [
-                "ffmpeg",
-                "-y",
-                "-i",
-                str(src),
+            base_cmd
+            + [
                 "-ar",
                 "8000",
                 "-ac",
@@ -203,43 +234,48 @@ def _synthesize_sync(
     if not plain:
         raise ValueError("TTS text is empty after cleanup")
 
-    engine = _ensure_engine()
-    style = _get_voice_style(engine, voice_name)
+    from ari_app.inference_pool import run_tts
 
-    use_speed = _clamp_speed(speed, lang=lang)
-    use_silence = max(0.12, min(float(silence_duration), 0.22))
+    def _do_synth() -> None:
+        engine = _ensure_engine()
+        style = _get_voice_style(engine, voice_name)
 
-    log.info(
-        "Supertonic synthesizing lang=%s voice=%s speed=%.2f chars=%s preview=%r",
-        lang,
-        voice_name,
-        use_speed,
-        len(plain),
-        plain[:60],
-    )
-    t0 = time.perf_counter()
-    wav, _duration = engine.synthesize(
-        plain,
-        voice_style=style,
-        lang=lang,
-        speed=use_speed,
-        silence_duration=use_silence,
-    )
-    log.info(
-        "Supertonic done in %.1fs speed=%.2f silence=%.2fs",
-        time.perf_counter() - t0,
-        use_speed,
-        use_silence,
-    )
+        use_speed = _clamp_speed(speed, lang=lang)
+        use_silence = max(0.08, min(float(silence_duration), 0.14))
 
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-        raw_wav = Path(tmp.name)
-    try:
-        engine.save_audio(wav, str(raw_wav))
-        _ffmpeg_to_asterisk_wav(raw_wav, out_wav, tail_pad_s=tail_pad_s)
-        log.info("Supertonic WAV ready for Asterisk: %s", out_wav)
-    finally:
-        raw_wav.unlink(missing_ok=True)
+        log.info(
+            "Supertonic synthesizing lang=%s voice=%s speed=%.2f chars=%s preview=%r",
+            lang,
+            voice_name,
+            use_speed,
+            len(plain),
+            plain[:60],
+        )
+        t0 = time.perf_counter()
+        wav, _duration = engine.synthesize(
+            plain,
+            voice_style=style,
+            lang=lang,
+            speed=use_speed,
+            silence_duration=use_silence,
+        )
+        log.info(
+            "Supertonic done in %.1fs speed=%.2f silence=%.2fs",
+            time.perf_counter() - t0,
+            use_speed,
+            use_silence,
+        )
+
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            raw_wav = Path(tmp.name)
+        try:
+            engine.save_audio(wav, str(raw_wav))
+            _ffmpeg_to_asterisk_wav(raw_wav, out_wav, tail_pad_s=tail_pad_s)
+            log.info("Supertonic WAV ready for Asterisk: %s", out_wav)
+        finally:
+            raw_wav.unlink(missing_ok=True)
+
+    run_tts(_do_synth)
 
 
 def concat_asterisk_wavs(
@@ -329,9 +365,11 @@ async def synthesize_to_wav(
         session_lang=resolved_lang,
     )
 
+    from ari_app.inference_pool import get_executor
+
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(
-        None,
+        get_executor(),
         lambda: _synthesize_sync(
             text,
             out_wav,

@@ -40,8 +40,93 @@ _SILENCE_TRANSCRIPT_JUNK = frozenset(
         "oh",
         "ah",
         "hey",
+        "ha",
+        "huh",
+        "eh",
+        "er",
+        "thank you",
+        "thanks",
+        "okay",
+        "ok",
     }
 )
+
+
+def _log_turn_latency_breakdown(
+    session_id: str,
+    turn: int,
+    *,
+    pause_before_response_s: float,
+    stt_s: float,
+    llm_s: float,
+    tts_synth_s: float,
+    tts_play_s: float,
+    reply_chars: int,
+    record_duration_s: float,
+    record_silence_s: float,
+) -> None:
+    """One-line diagnosis of where time went after the user stopped talking."""
+    after_stop = (
+        pause_before_response_s + stt_s + llm_s + tts_synth_s + tts_play_s
+    )
+    if after_stop <= 0:
+        return
+
+    def pct(x: float) -> float:
+        return 100.0 * x / after_stop
+
+    parts = [
+        ("play", tts_play_s),
+        ("synth", tts_synth_s),
+        ("stt", stt_s),
+        ("pause", pause_before_response_s),
+        ("llm", llm_s),
+    ]
+    parts.sort(key=lambda p: p[1], reverse=True)
+    top = parts[0][0]
+
+    log.info(
+        "[%s] turn=%s latency breakdown (after user stops talking): "
+        "silence_end_wait~%.1fs (RECORD_MAX_SILENCE) + pause=%.2fs stt=%.2fs llm=%.2fs "
+        "tts_synth=%.2fs tts_play=%.2fs → total=%.2fs | reply=%s chars | "
+        "recorded_audio=%.1fs",
+        session_id,
+        turn,
+        record_silence_s,
+        pause_before_response_s,
+        stt_s,
+        llm_s,
+        tts_synth_s,
+        tts_play_s,
+        after_stop,
+        reply_chars,
+        record_duration_s,
+    )
+    log.info(
+        "[%s] turn=%s share: play=%.0f%% synth=%.0f%% stt=%.0f%% llm=%.0f%% pause=%.0f%% "
+        "| main bottleneck=%s",
+        session_id,
+        turn,
+        pct(tts_play_s),
+        pct(tts_synth_s),
+        pct(stt_s),
+        pct(llm_s),
+        pct(pause_before_response_s),
+        top,
+    )
+    if tts_play_s >= 5.0 and reply_chars > 80:
+        log.info(
+            "[%s] hint: tts_play is how long Asterisk plays the reply (~%.0f%%). "
+            "Use REPLY_MAX_SENTENCES=1 REPLY_MAX_CHARS=100–120 for faster turns.",
+            session_id,
+            pct(tts_play_s),
+        )
+    if tts_synth_s >= 2.5:
+        log.info(
+            "[%s] hint: tts_synth is Supertonic+ffmpeg; concurrent calls share GPU slots "
+            "(WHISPER_MAX_CONCURRENT / TTS_MAX_CONCURRENT).",
+            session_id,
+        )
 
 
 def _drop_likely_silence_hallucination(text: str) -> str:
@@ -329,7 +414,9 @@ class CallSession:
         url = f"{self.ari_base}/recordings/stored/{recording_name}/file"
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
             p = Path(tmp.name)
-        ok = await stt.download_recording_file(url=url, dest=p, auth=self.auth)
+        ok = await stt.download_recording_file(
+            url=url, dest=p, auth=self.auth, client=self.client
+        )
         if not ok:
             p.unlink(missing_ok=True)
             return None
@@ -408,9 +495,11 @@ class CallSession:
             user_text, whisper_lang = await stt_coro
             return user_text, whisper_lang, None
 
+        from ari_app.inference_pool import get_executor
+
         loop = asyncio.get_running_loop()
         pitch_coro = loop.run_in_executor(
-            None, lambda: gender.estimate_pitch_hz(wav_path)
+            get_executor(), lambda: gender.estimate_pitch_hz(wav_path)
         )
         (user_text, whisper_lang), pitch_hz = await asyncio.gather(
             stt_coro, pitch_coro
@@ -421,6 +510,9 @@ class CallSession:
         sub = self.settings.tts_sound_subdir.strip("/ ")
         base = out_wav.name.replace(".wav", "")
         await self.play_sound(f"sound:{sub}/{base}")
+        settle_ms = self.settings.tts_post_play_settle_ms
+        if settle_ms > 0 and not self._closed:
+            await asyncio.sleep(settle_ms / 1000.0)
 
     async def _speak_phrase_immediate(
         self,
@@ -752,7 +844,9 @@ class CallSession:
                             )
                         continue
 
+                    t_pause = time.perf_counter()
                     await self._pause_before_response()
+                    pause_before_response_s = time.perf_counter() - t_pause
 
                     t_turn = time.perf_counter()
                     user_text, whisper_lang, pitch_hz = await self._transcribe_turn(
@@ -891,17 +985,18 @@ class CallSession:
                             "[%s] LLM replied in Latin/English while lang=hi",
                             self.ctx.session_id,
                         )
-                    log.info(
-                        "[%s] turn=%s latency: stt=%.2fs llm=%.2fs "
-                        "tts_synth=%.2fs tts_play=%.2fs (play=audio duration) total=%.2fs ctx_msgs=%s",
+                    reply_chars = len((reply or "").strip())
+                    _log_turn_latency_breakdown(
                         self.ctx.session_id,
                         self.ctx.turn_count,
-                        stt_s,
-                        llm_s,
-                        self._last_tts_synth_s,
-                        self._last_tts_play_s,
-                        time.perf_counter() - t_turn,
-                        len(self.ctx.messages),
+                        pause_before_response_s=pause_before_response_s,
+                        stt_s=stt_s,
+                        llm_s=llm_s,
+                        tts_synth_s=self._last_tts_synth_s,
+                        tts_play_s=self._last_tts_play_s,
+                        reply_chars=reply_chars,
+                        record_duration_s=duration_sec,
+                        record_silence_s=self._effective_record_silence_seconds(),
                     )
                 except asyncio.CancelledError:
                     break

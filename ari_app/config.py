@@ -61,6 +61,7 @@ class Settings:
     supertonic_speed_hi: float  # conversation replies in Hindi
     supertonic_silence_duration: float
     tts_tail_pad_seconds: float
+    tts_post_play_settle_ms: int  # wait after PlaybackFinished (echo / ghost on mic)
     tts_chunk_max_chars: int
     session_max_messages: int
     call_primary_lang: str  # hi | en — default when turn is ambiguous
@@ -73,6 +74,9 @@ class Settings:
     continuous_pause_before_listen_ms: int
     continuous_pause_before_response_ms: int
     continuous_tts_tail_pad_seconds: float
+    whisper_max_concurrent: int
+    tts_max_concurrent: int
+    inference_thread_workers: int  # 0 = auto from slots
 
 
 def _float_env(name: str, default: float) -> float:
@@ -121,7 +125,25 @@ def _whisper_language_from_env() -> str | None:
     return raw
 
 
+def _default_whisper_max_concurrent() -> int:
+    raw = os.getenv("WHISPER_MAX_CONCURRENT", "").strip()
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            pass
+    from ari_app.stt import _whisper_device
+
+    model = (os.getenv("WHISPER_MODEL") or "medium").strip().lower()
+    if "large" in model:
+        return 2 if _whisper_device() == "cuda" else 1
+    return 3 if _whisper_device() == "cuda" else 2
+
+
 def load_settings() -> Settings:
+    whisper_slots = _default_whisper_max_concurrent()
+    tts_slots = max(1, _int_env("TTS_MAX_CONCURRENT", 2))
+    thread_workers = _int_env("INFERENCE_THREAD_WORKERS", 0)
     return Settings(
         ari_host=os.getenv("ARI_HOST", "127.0.0.1"),
         ari_port=int(os.getenv("ARI_PORT", "8088")),
@@ -133,7 +155,7 @@ def load_settings() -> Settings:
         vllm_model=os.getenv("VLLM_MODEL", "google/gemma-4-E2B-it"),
         vllm_timeout_seconds=_float_env("VLLM_TIMEOUT_SECONDS", 120.0),
         vllm_connect_timeout_seconds=_float_env("VLLM_CONNECT_TIMEOUT_SECONDS", 15.0),
-        whisper_model=os.getenv("WHISPER_MODEL", "large-v3"),
+        whisper_model=os.getenv("WHISPER_MODEL", "medium"),
         whisper_language=_whisper_language_from_env(),
         tts_sound_subdir=os.getenv("TTS_SOUND_SUBDIR", "custom"),
         tts_voice=(
@@ -204,8 +226,9 @@ def load_settings() -> Settings:
         ),
         supertonic_speed_en=_float_env("SUPERTONIC_SPEED_EN", 1.06),
         supertonic_speed_hi=_float_env("SUPERTONIC_SPEED_HI", 1.08),
-        supertonic_silence_duration=_float_env("SUPERTONIC_SILENCE_DURATION", 0.18),
-        tts_tail_pad_seconds=_float_env("TTS_TAIL_PAD_SECONDS", 0.15),
+        supertonic_silence_duration=_float_env("SUPERTONIC_SILENCE_DURATION", 0.12),
+        tts_tail_pad_seconds=_float_env("TTS_TAIL_PAD_SECONDS", 0.0),
+        tts_post_play_settle_ms=_int_env("TTS_POST_PLAY_SETTLE_MS", 150),
         tts_chunk_max_chars=_int_env("TTS_CHUNK_MAX_CHARS", 280),
         session_max_messages=_int_env("SESSION_MAX_MESSAGES", 20),
         call_primary_lang=_call_primary_lang_from_env(),
@@ -230,4 +253,7 @@ def load_settings() -> Settings:
         continuous_tts_tail_pad_seconds=_float_env(
             "CONTINUOUS_TTS_TAIL_PAD_SECONDS", 0.06
         ),
+        whisper_max_concurrent=whisper_slots,
+        tts_max_concurrent=tts_slots,
+        inference_thread_workers=thread_workers,
     )

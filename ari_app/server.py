@@ -15,6 +15,8 @@ from fastapi.responses import JSONResponse
 from ari_app.ari_loop import get_active_call_registry, run_ari_forever
 from ari_app.config import load_settings
 from ari_app.llm import check_vllm_reachable
+from ari_app.inference_pool import configure as configure_inference_pool
+from ari_app.inference_pool import pool_status, shutdown as shutdown_inference_pool
 from ari_app.stt import warmup_whisper
 from ari_app.tts import warmup_supertonic
 
@@ -41,6 +43,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     if not settings.ari_password:
         log.error("Set ARI_PASSWORD in the environment or .env file.")
         raise RuntimeError("ARI_PASSWORD is not set")
+
+    workers = settings.inference_thread_workers or None
+    configure_inference_pool(
+        whisper_max_concurrent=settings.whisper_max_concurrent,
+        tts_max_concurrent=settings.tts_max_concurrent,
+        thread_workers=workers,
+    )
 
     loop = asyncio.get_running_loop()
     def _warmup_models() -> None:
@@ -70,6 +79,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await task
+    shutdown_inference_pool()
 
 
 app = FastAPI(title="Asterisk Callbot", lifespan=lifespan)
@@ -83,6 +93,7 @@ async def health() -> JSONResponse:
             "status": "ok",
             "active_calls": registry.active_count(),
             "calls": registry.list_active(),
+            "inference_pool": pool_status(),
         }
     )
 

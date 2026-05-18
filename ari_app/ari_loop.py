@@ -21,6 +21,7 @@ from ari_app.call_session import (
     stasis_channel_peer_info,
 )
 from ari_app.config import load_settings
+from ari_app.inference_pool import configure as configure_inference_pool
 from ari_app.stt import whisper_runtime_info
 
 log = logging.getLogger("ari_callbot")
@@ -42,6 +43,12 @@ def _sounds_en_dir():
 async def run_ari_forever() -> None:
     global _conn_refused_hint_logged
     settings = load_settings()
+    workers = settings.inference_thread_workers or None
+    configure_inference_pool(
+        whisper_max_concurrent=settings.whisper_max_concurrent,
+        tts_max_concurrent=settings.tts_max_concurrent,
+        thread_workers=workers,
+    )
     if not settings.ari_password:
         log.error("Set ARI_PASSWORD in the environment or .env file.")
         sys.exit(1)
@@ -114,7 +121,12 @@ async def run_ari_forever() -> None:
                     sessions.pop(cid, None)
                     registry.unregister(cid)
 
-            asyncio.create_task(_task())
+            asyncio.create_task(_task(), name=f"call-{ctx.session_id}")
+            log.info(
+                "Call task started session=%s active_calls=%s",
+                ctx.session_id,
+                registry.active_count(),
+            )
             return
 
         if et == "RecordingFinished":
@@ -149,7 +161,8 @@ async def run_ari_forever() -> None:
             return
 
     log.info(
-        "ARI WebSocket app=%s sounds_en=%s vLLM=%s whisper=%s lang=%s model=%s tts=supertonic voice_en=%s voice_hi=%s",
+        "ARI WebSocket app=%s sounds_en=%s vLLM=%s whisper=%s lang=%s model=%s "
+        "tts=supertonic voice_en=%s voice_hi=%s concurrent_whisper=%s concurrent_tts=%s",
         settings.stasis_app,
         sounds_en,
         settings.vllm_base_url,
@@ -158,9 +171,12 @@ async def run_ari_forever() -> None:
         settings.whisper_model,
         settings.tts_voice,
         settings.tts_voice_hi or "(same as en)",
+        settings.whisper_max_concurrent,
+        settings.tts_max_concurrent,
     )
 
-    async with httpx.AsyncClient(timeout=180.0) as http_client:
+    limits = httpx.Limits(max_connections=64, max_keepalive_connections=32)
+    async with httpx.AsyncClient(timeout=180.0, limits=limits) as http_client:
         while True:
             try:
                 async with websockets.connect(
