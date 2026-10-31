@@ -165,4 +165,14 @@ def merge_gender_estimate(
         )
         return guess, history, True
 
+    # Tentative guess for Hindi grammar before full confidence (caller still shown as ? in logs).
+    if guess and len(history) >= min_samples:
+        log.debug(
+            "pitch gender tentative: %s (median=%.0fHz n=%s)",
+            guess,
+            float(np.median(history)),
+            len(history),
+        )
+        return guess, history, False
+
     return current, history, False

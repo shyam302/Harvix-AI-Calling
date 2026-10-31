@@ -5,5 +5,22 @@ openai>=1.40.0
 faster-whisper>=1.0.0
 supertonic
 numpy
+# TTS GPU: install ONLY onnxruntime-gpu (do not pip install onnxruntime — it hides CUDA)
+onnxruntime-gpu>=1.18.0
+# nvidia-cuda-runtime-cu12 nvidia-cublas-cu12 nvidia-curand-cu12 nvidia-cudnn-cu12 nvidia-cufft-cu12
+ddgs>=9.0.0
+duckduckgo-search>=6.0.0
+beautifulsoup4>=4.12.0
+playwright>=1.40.0
+crawl4ai>=0.4.0
+langchain>=0.3.0
+langchain-core>=0.3.0
+langchain-text-splitters>=0.3.0
+edge-tts>=6.1.0
+# Caller gender (Wav2Vec2, once per call after greeting): transformers torch librosa
+transformers>=4.40.0
+torch>=2.0.0
+librosa>=0.10.0
+google-search-results>=2.4.0
 fastapi>=0.115.0
 uvicorn[standard]>=0.30.0

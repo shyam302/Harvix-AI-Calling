@@ -32,7 +32,11 @@ class Settings:
     gender_female_min_hz: float
     gender_male_max_hz: float
     gender_min_pitch_samples: int
-    gender_detect_caller: bool  # estimate pitch each turn
+    gender_detect_caller: bool  # estimate pitch each turn (fallback if model off)
+    gender_model_enabled: bool  # Wav2Vec2 once after greeting on long utterance
+    gender_model_min_duration_s: float
+    gender_model_min_chars: int
+    gender_model_min_confidence: float
     gender_adapt_when_confident: bool  # tailor replies to caller only when pitch is confident
     gender_mirror_caller: bool  # also switch TTS voice to M1/F3 when confident
     gender_mirror_grammar: bool  # deprecated alias for gender_adapt_when_confident
@@ -41,17 +45,28 @@ class Settings:
     agent_gender: str  # neutral | female | male — bot grammar (default neutral)
     agent_voice_gender: str  # female | male — TTS voice (AGENT_VOICE_GENDER)
     grammar_match_voice: bool  # if true and AGENT_GENDER=neutral, match voice (usually false)
+    hindi_grammar_use_agent_persona: bool  # if false: neutral/male/female Hindi only from caller pitch
     gender_grammar_until_confident: bool  # Hindi neutral until caller pitch is confident
     gender_grammar_min_turns: int  # user turns before persona grammar unlocks
     llm_temperature: float
     opening_greeting: str
+    opening_greeting_dynamic: bool  # varied line each call when OPENING_GREETING empty
     record_max_silence_seconds: float
+    record_format: str  # wav16 keeps G.722 wideband audio for Whisper; falls back to wav
+    vad_enabled: bool  # end turns with Silero VAD on live caller audio (snoop + RTP)
+    vad_end_silence_ms: int  # silence after speech that ends the caller's turn
+    vad_speech_threshold: float
+    vad_no_speech_timeout_s: float  # stop listening if the caller says nothing
+    barge_in_enabled: bool  # caller can interrupt the bot while it speaks
+    barge_in_threshold: float  # stricter than listening so line echo does not trigger
+    barge_in_min_speech_ms: int  # sustained speech needed to cut the bot off
     prompt_on_silence: bool  # if false, stay on mic (no "say again?") on empty/silent turns
     record_max_duration_seconds: int
     pause_after_tts_ms: int
     pause_before_listen_ms: int
     pause_before_response_ms: int
     record_min_duration_seconds: float
+    record_max_consecutive_empty: int  # stop listening loop after N empty/silent turns
     llm_max_tokens: int
     reply_max_sentences: int
     reply_max_chars: int
@@ -64,9 +79,9 @@ class Settings:
     tts_post_play_settle_ms: int  # wait after PlaybackFinished (echo / ghost on mic)
     tts_chunk_max_chars: int
     session_max_messages: int
-    call_primary_lang: str  # hi | en — default when turn is ambiguous
-    lang_switch_min_en_words: int
-    lang_switch_consecutive_en: int
+    call_primary_lang: str  # hi | en — greeting language until the caller speaks
+    lang_switch_min_words: int  # caller words needed before switching reply language
+    lang_switch_min_prob: float  # Whisper language confidence needed to switch
     continuous_conversation: bool  # streaming LLM + short gaps (less walkie-talkie)
     llm_streaming: bool  # stream tokens from vLLM when continuous mode on
     continuous_record_max_silence_seconds: float
@@ -77,6 +92,19 @@ class Settings:
     whisper_max_concurrent: int
     tts_max_concurrent: int
     inference_thread_workers: int  # 0 = auto from slots
+    web_search_enabled: bool
+    google_cse_api_key: str
+    google_cse_cx: str
+    serpapi_api_key: str
+    web_search_num_results: int
+    web_search_timeout_seconds: float
+    web_search_provider: str  # auto | crawl | serpapi | google | duckduckgo
+    crawl_max_pages: int
+    crawl_page_timeout_seconds: float
+    tts_backend: str  # supertonic | edge
+    edge_tts_voice_en: str
+    edge_tts_voice_hi: str
+    edge_tts_rate: str  # e.g. +0% or +5%
 
 
 def _float_env(name: str, default: float) -> float:
@@ -100,8 +128,8 @@ def _int_env(name: str, default: int) -> int:
 
 
 def _call_primary_lang_from_env() -> str:
-    raw = (os.getenv("CALL_PRIMARY_LANG", "hi") or "hi").strip().lower()
-    return raw if raw in ("hi", "en") else "hi"
+    raw = (os.getenv("CALL_PRIMARY_LANG", "en") or "en").strip().lower()
+    return raw if raw in ("hi", "en") else "en"
 
 
 def _agent_gender_from_env() -> str:
@@ -184,8 +212,13 @@ def load_settings() -> Settings:
         gender_min_pitch_samples=_int_env("GENDER_MIN_PITCH_SAMPLES", 3),
         gender_detect_caller=os.getenv("GENDER_DETECT_CALLER", "true").strip().lower()
         not in ("0", "false", "no", "off"),
+        gender_model_enabled=os.getenv("GENDER_MODEL_ENABLED", "true").strip().lower()
+        not in ("0", "false", "no", "off"),
+        gender_model_min_duration_s=_float_env("GENDER_MODEL_MIN_DURATION_SECONDS", 2.0),
+        gender_model_min_chars=_int_env("GENDER_MODEL_MIN_CHARS", 12),
+        gender_model_min_confidence=_float_env("GENDER_MODEL_MIN_CONFIDENCE", 0.55),
         gender_adapt_when_confident=os.getenv(
-            "GENDER_ADAPT_WHEN_CONFIDENT", "true"
+            "GENDER_ADAPT_WHEN_CONFIDENT", "false"
         ).strip().lower()
         not in ("0", "false", "no", "off"),
         gender_mirror_caller=os.getenv("GENDER_MIRROR_CALLER", "false").strip().lower()
@@ -196,44 +229,60 @@ def load_settings() -> Settings:
         gender_confident_fraction=_float_env("GENDER_CONFIDENT_FRACTION", 0.8),
         agent_gender=_agent_gender_from_env(),
         agent_voice_gender=_agent_voice_gender_from_env(),
-        grammar_match_voice=os.getenv("GRAMMAR_MATCH_VOICE", "false").strip().lower()
+        grammar_match_voice=os.getenv("GRAMMAR_MATCH_VOICE", "true").strip().lower()
+        in ("1", "true", "yes", "on"),
+        hindi_grammar_use_agent_persona=os.getenv(
+            "HINDI_GRAMMAR_USE_AGENT_PERSONA", "true"
+        ).strip().lower()
         in ("1", "true", "yes", "on"),
         gender_grammar_until_confident=os.getenv(
-            "GENDER_GRAMMAR_UNTIL_CONFIDENT", "true"
+            "GENDER_GRAMMAR_UNTIL_CONFIDENT", "false"
         ).strip().lower()
         not in ("0", "false", "no", "off"),
         gender_grammar_min_turns=_int_env("GENDER_GRAMMAR_MIN_TURNS", 2),
-        llm_temperature=_float_env("LLM_TEMPERATURE", 0.82),
-        opening_greeting=(
-            os.getenv("OPENING_GREETING") or "Hi, how can I help?"
-        ).strip()
-        or "Hi, how can I help?",
-        record_max_silence_seconds=_float_env("RECORD_MAX_SILENCE_SECONDS", 1.4),
+        llm_temperature=_float_env("LLM_TEMPERATURE", 0.7),
+        opening_greeting=(os.getenv("OPENING_GREETING") or "").strip(),
+        opening_greeting_dynamic=os.getenv(
+            "OPENING_GREETING_DYNAMIC", "true"
+        ).strip().lower()
+        not in ("0", "false", "no", "off"),
+        record_max_silence_seconds=_float_env("RECORD_MAX_SILENCE_SECONDS", 0.9),
+        record_format=(os.getenv("RECORD_FORMAT") or "wav16").strip().lower(),
+        vad_enabled=os.getenv("VAD_ENABLED", "true").strip().lower()
+        not in ("0", "false", "no", "off"),
+        vad_end_silence_ms=_int_env("VAD_END_SILENCE_MS", 700),
+        vad_speech_threshold=_float_env("VAD_SPEECH_THRESHOLD", 0.5),
+        vad_no_speech_timeout_s=_float_env("VAD_NO_SPEECH_TIMEOUT_SECONDS", 8.0),
+        barge_in_enabled=os.getenv("BARGE_IN_ENABLED", "true").strip().lower()
+        not in ("0", "false", "no", "off"),
+        barge_in_threshold=_float_env("BARGE_IN_THRESHOLD", 0.7),
+        barge_in_min_speech_ms=_int_env("BARGE_IN_MIN_SPEECH_MS", 400),
         prompt_on_silence=os.getenv("PROMPT_ON_SILENCE", "false").strip().lower()
         in ("1", "true", "yes", "on"),
         record_max_duration_seconds=_int_env("RECORD_MAX_DURATION_SECONDS", 45),
-        pause_after_tts_ms=_int_env("PAUSE_AFTER_TTS_MS", 200),
-        pause_before_listen_ms=_int_env("PAUSE_BEFORE_LISTEN_MS", 250),
-        pause_before_response_ms=_int_env("PAUSE_BEFORE_RESPONSE_MS", 120),
+        pause_after_tts_ms=_int_env("PAUSE_AFTER_TTS_MS", 80),
+        pause_before_listen_ms=_int_env("PAUSE_BEFORE_LISTEN_MS", 80),
+        pause_before_response_ms=_int_env("PAUSE_BEFORE_RESPONSE_MS", 0),
         record_min_duration_seconds=_float_env("RECORD_MIN_DURATION_SECONDS", 0.35),
-        llm_max_tokens=_int_env("LLM_MAX_TOKENS", 120),
+        record_max_consecutive_empty=_int_env("RECORD_MAX_CONSECUTIVE_EMPTY", 8),
+        llm_max_tokens=_int_env("LLM_MAX_TOKENS", 160),
         reply_max_sentences=_int_env("REPLY_MAX_SENTENCES", 2),
-        reply_max_chars=_int_env("REPLY_MAX_CHARS", 260),
-        supertonic_speed=_float_env("SUPERTONIC_SPEED", 1.08),
+        reply_max_chars=_int_env("REPLY_MAX_CHARS", 220),
+        supertonic_speed=_float_env("SUPERTONIC_SPEED", 1.0),
         supertonic_speed_greeting=_float_env(
             "SUPERTONIC_SPEED_GREETING",
-            _float_env("SUPERTONIC_SPEED_EN", 1.06),
+            _float_env("SUPERTONIC_SPEED_EN", 1.0),
         ),
-        supertonic_speed_en=_float_env("SUPERTONIC_SPEED_EN", 1.06),
-        supertonic_speed_hi=_float_env("SUPERTONIC_SPEED_HI", 1.08),
-        supertonic_silence_duration=_float_env("SUPERTONIC_SILENCE_DURATION", 0.12),
+        supertonic_speed_en=_float_env("SUPERTONIC_SPEED_EN", 1.0),
+        supertonic_speed_hi=_float_env("SUPERTONIC_SPEED_HI", 1.02),
+        supertonic_silence_duration=_float_env("SUPERTONIC_SILENCE_DURATION", 0.2),
         tts_tail_pad_seconds=_float_env("TTS_TAIL_PAD_SECONDS", 0.0),
-        tts_post_play_settle_ms=_int_env("TTS_POST_PLAY_SETTLE_MS", 150),
-        tts_chunk_max_chars=_int_env("TTS_CHUNK_MAX_CHARS", 280),
-        session_max_messages=_int_env("SESSION_MAX_MESSAGES", 20),
+        tts_post_play_settle_ms=_int_env("TTS_POST_PLAY_SETTLE_MS", 60),
+        tts_chunk_max_chars=_int_env("TTS_CHUNK_MAX_CHARS", 120),
+        session_max_messages=_int_env("SESSION_MAX_MESSAGES", 24),
         call_primary_lang=_call_primary_lang_from_env(),
-        lang_switch_min_en_words=_int_env("LANG_SWITCH_MIN_EN_WORDS", 4),
-        lang_switch_consecutive_en=_int_env("LANG_SWITCH_CONSECUTIVE_EN", 1),
+        lang_switch_min_words=_int_env("LANG_SWITCH_MIN_WORDS", 2),
+        lang_switch_min_prob=_float_env("LANG_SWITCH_MIN_PROB", 0.6),
         continuous_conversation=os.getenv(
             "CONTINUOUS_CONVERSATION", "false"
         ).strip().lower()
@@ -256,4 +305,24 @@ def load_settings() -> Settings:
         whisper_max_concurrent=whisper_slots,
         tts_max_concurrent=tts_slots,
         inference_thread_workers=thread_workers,
+        web_search_enabled=os.getenv("WEB_SEARCH_ENABLED", "true").strip().lower()
+        not in ("0", "false", "no", "off"),
+        google_cse_api_key=(os.getenv("GOOGLE_CSE_API_KEY") or "").strip(),
+        google_cse_cx=(os.getenv("GOOGLE_CSE_CX") or "").strip(),
+        serpapi_api_key=(os.getenv("SERPAPI_API_KEY") or "").strip(),
+        web_search_num_results=_int_env("WEB_SEARCH_NUM_RESULTS", 3),
+        web_search_timeout_seconds=_float_env("WEB_SEARCH_TIMEOUT_SECONDS", 10.0),
+        web_search_provider=(
+            os.getenv("WEB_SEARCH_PROVIDER", "fast").strip().lower() or "fast"
+        ),
+        crawl_max_pages=_int_env("CRAWL_MAX_PAGES", 1),
+        crawl_page_timeout_seconds=_float_env("CRAWL_PAGE_TIMEOUT_SECONDS", 12.0),
+        tts_backend=(os.getenv("TTS_BACKEND", "supertonic").strip().lower() or "supertonic"),
+        edge_tts_voice_en=(
+            os.getenv("EDGE_TTS_VOICE_EN") or "en-IN-NeerjaNeural"
+        ).strip(),
+        edge_tts_voice_hi=(
+            os.getenv("EDGE_TTS_VOICE_HI") or "hi-IN-SwaraNeural"
+        ).strip(),
+        edge_tts_rate=(os.getenv("EDGE_TTS_RATE") or "+0%").strip() or "+0%",
     )

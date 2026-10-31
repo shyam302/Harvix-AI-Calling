@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import AsyncIterator
 
 import httpx
@@ -10,73 +11,95 @@ from openai import APIConnectionError, APITimeoutError, AsyncOpenAI
 
 log = logging.getLogger(__name__)
 
-# Shared traits: general phone conversation (informative, engaging, neutral wording).
-_CONVERSATION_STYLE_EN = (
-    "You are the voice on a friendly general phone conversation—not a call center, "
-    "not a sales script, not a chatbot. Your replies will be spoken aloud in a clear, "
-    "warm female voice; write text that sounds natural when read aloud. "
-    "Be informative: give a useful fact, option, or next step when it helps. "
-    "Be engaging: respond to what they said, show interest, ask one short follow-up "
-    "when it fits (not every turn). "
-    "Do not start with filler sounds or words (no oh, ah, uh, um, hmm, well, so, got it). "
-    "Begin with the substance. Use contractions. "
-    "Phone rule: at most one or two short sentences (~15 words each); never lecture. "
-    "Stay gender-neutral about yourself (no as a woman/man, no gendered bragging). "
-    "Never say Certainly, I'd be happy to, As an AI, or mention bots, recording, or models. "
-    "No bullet lists, markdown, or emojis."
+# Real-time phone agent: everything the model writes is spoken aloud by TTS.
+# Positive, concrete guidance works better than long "never do X" lists on small models.
+_PHONE_AGENT_CORE_EN = (
+    "You are a warm, friendly person talking with a caller on a live phone call. "
+    "Everything you write is spoken aloud, so write exactly what you would say.\n"
+    "How to talk:\n"
+    "- First react to what the caller just said (a quick natural acknowledgement such as "
+    "'Oh nice', 'Got it', 'Ah, that makes sense', 'Okay'), then answer.\n"
+    "- Keep it short: one or two natural sentences, usually under 30 words.\n"
+    "- Remember everything said earlier in this call. Use the details the caller "
+    "gave you (their name only if they told you), connect your answer to what they said before, and never ask for something "
+    "they already told you.\n"
+    "- Keep the conversation going: when it fits, end with one short, relevant follow-up "
+    "question about what they just said. Not every turn needs a question.\n"
+    "- Sound like a real person: contractions, simple everyday words, gentle warmth. "
+    "Match the caller's mood: calm and kind if upset, simpler if confused, cheerful if happy.\n"
+    "- If you did not understand, say so briefly and ask them to say it again.\n"
+    "- If they thank you or say bye, close warmly in one line.\n"
+    "Never use lists, markdown, emojis, or placeholders like [Your Name]. "
+    "Do not say 'How may I assist you' or 'Thank you for calling'. "
+    "Do not mention being an AI, a bot, or a model unless the caller asks directly."
 )
 
-_CONVERSATION_STYLE_HI = (
-    "आप एक सामान्य, गर्मजोशी भरी फ़ोन बातचीत की आवाज़ हैं—कॉल-सेंटर या रोबोट नहीं। "
-    "जवाब बोलकर सुनाए जाएँगे (स्पष्ट, दोस्ताना महिला आवाज़); ऐसा लिखें जो सुनने में सहज लगे। "
-    "जानकारी दें: जहाँ उपयोगी हो एक छोटा तथ्य, विकल्प, या अगला कदम बताएँ। "
-    "रुचि दिखाएँ: उनकी बात पर प्रतिक्रिया दें; ज़रूरत हो तो एक छोटा सवाल पूछें (हर बार नहीं)। "
-    "शुरुआत में भराव शब्द न लिखें (न ओह, अह, हmm, अच्छा, अरे से शुरू) — सीधे मुख्य बात से शुरू करें। "
-    "ज़रूरी—लिंग-तटस्थ हिंदी: अपने लिए न करता/करती, न सकता/सकती, न गया/गई, "
-    "न बताऊँगा/बताऊँगी, न समझ गया/गई, न मैं महिला/पुरुष हूँ। "
-    "ठीक है, बताइए, हो जाएगा, देखते हैं, चलिए, कर देंगे जैसे रूप प्रयोग करें। "
-    "सामने वाले की लिंग अनुमानित न करें; सम्मान से आप। "
-    "केवल देवनागरी, बोलचाल की हिंदी; रोमन/अंग्रेज़ी नहीं। एक या दो छोटे वाक्य। "
-    "AI, रिकॉर्डिंग, या मॉडल का ज़िक्र न करें।"
+_PHONE_AGENT_CORE_HI = (
+    "आप लाइव फ़ोन कॉल पर कॉलर से बात कर रहे एक गर्मजोशी भरे, दोस्ताना इंसान हैं। "
+    "आप जो लिखेंगे वह सीधे बोला जाएगा, इसलिए वही लिखें जो फ़ोन पर बोलते हैं।\n"
+    "कैसे बात करें:\n"
+    "- पहले कॉलर की बात पर छोटी-सी सहज प्रतिक्रिया दें (जैसे 'अच्छा', 'अरे वाह', "
+    "'जी, ठीक है'), फिर जवाब दें।\n"
+    "- जवाब छोटा रखें: एक या दो सहज वाक्य, आमतौर पर 25 शब्दों से कम।\n"
+    "- इस कॉल में पहले कही गई हर बात याद रखें। कॉलर की बताई बातें (नाम तभी, जब उन्होंने ख़ुद बताया हो) इस्तेमाल करें, "
+    "जवाब को उनकी पिछली बात से जोड़ें, और जो वे बता चुके हैं वह दोबारा न पूछें।\n"
+    "- बातचीत आगे बढ़ाएँ: जब सही लगे, उनकी बात से जुड़ा एक छोटा सवाल पूछें। "
+    "हर बार सवाल ज़रूरी नहीं।\n"
+    "- असली इंसान की तरह बोलें: रोज़मर्रा की आसान हिंदी, अपनापन। "
+    "कॉलर परेशान हो तो नरमी से, उलझन में हो तो आसान शब्दों में, खुश हो तो खुशी से।\n"
+    "- बात समझ न आए तो छोटे में बताएँ और दोबारा बोलने को कहें।\n"
+    "- धन्यवाद या अलविदा पर एक लाइन में प्यार से बात खत्म करें।\n"
+    "सूची, मार्कडाउन, इमोजी या [नाम] जैसे खाली निशान न लिखें। "
+    "AI, बॉट या मॉडल का ज़िक्र तभी करें जब कॉलर सीधे पूछे। "
+    "केवल देवनागरी में बोलचाल की हिंदी लिखें; अंग्रेज़ी के आम शब्द देवनागरी में चल सकते हैं।"
 )
 
-SYSTEM_PROMPT_EN_CONVERSATION = _CONVERSATION_STYLE_EN
+_PERSONA_EN = {
+    "female": " Your voice is a woman's.",
+    "male": " Your voice is a man's.",
+    "neutral": " Keep wording about yourself gender-neutral.",
+}
 
-SYSTEM_PROMPT_EN_MALE = (
-    "You are on a friendly general phone call—not a call center or chatbot. "
-    "Be informative and engaging: respond to what they said, add something useful, "
-    "ask a short follow-up when natural. No oh/ah/hmm at the start. One or two sentences. "
-    "Never mention AI or recording. No lists, markdown, or emojis."
-)
-
-SYSTEM_PROMPT_HI_CONVERSATION = _CONVERSATION_STYLE_HI
-
-SYSTEM_PROMPT_HI_MALE = (
-    "आप फ़ोन पर सामान्य, दोस्ताना बातचीत कर रहे हैं—रोबोट या स्क्रिप्ट नहीं। "
-    "जानकारीपूर्ण और रुचिकर जवाब दें; सामने वाले की बात पर सीधा प्रतिक्रिया दें। "
-    "केवल देवनागरी, बोलचाल की हिंदी। एक या दो छोटे वाक्य। AI का ज़िक्र न करें।"
-)
-
-HINDI_SESSION_NUDGE = (
-    " यह कॉल हिंदी में है—हर जवाब केवल देवनागरी में, सुनने में सहज और बोलचाल जैसा।"
-)
-
-VOICE_NEUTRAL_GRAMMAR_NUDGE_EN = (
-    " Output is spoken in a warm female voice; keep wording gender-neutral."
-)
-VOICE_NEUTRAL_GRAMMAR_NUDGE_HI = (
-    " आवाज़ गर्म और स्पष्ट महिला है; लिखावट पूरी तरह लिंग-तटस्थ रखें।"
-)
-
-_CALLER_GRAMMAR_NUDGE = {
-    "male": (
-        " कॉलर पुरुष की आवाज़ जैसे (आश्वस्त)—उनसे सम्मान से आप। "
-        "आप खुद लिंग-तटस्थ रहें; जानकारीपूर्ण और दोस्ताना बातचीत जारी रखें।"
-    ),
+_PERSONA_HI = {
     "female": (
-        " कॉलर महिला की आवाज़ जैसी (आश्वस्त)—उनसे सम्मान से आप। "
-        "आप खुद लिंग-तटस्थ रहें; जानकारीपूर्ण और दोस्ताना बातचीत जारी रखें।"
+        " आप महिला हैं—अपने लिए हमेशा स्त्रीलिंग: समझ गई, कर सकती हूँ, बताती हूँ, देखती हूँ।"
     ),
+    "male": (
+        " आप पुरुष हैं—अपने लिए हमेशा पुल्लिंग: समझ गया, कर सकता हूँ, बताता हूँ, देखता हूँ।"
+    ),
+    "neutral": (
+        " अपने लिए लिंग-तटस्थ वाक्य बोलें (जैसे 'बताइए', 'देखते हैं', 'हो सकता है')।"
+    ),
+}
+
+_PERSONA_OTHER = {
+    "female": " You are a woman; where the language marks gender, use feminine forms for yourself.",
+    "male": " You are a man; where the language marks gender, use masculine forms for yourself.",
+    "neutral": " Keep wording about yourself gender-neutral.",
+}
+
+
+def _reply_language_rule(reply_lang: str) -> str:
+    from ari_app.lang import language_name
+
+    name = language_name(reply_lang)
+    return (
+        f" The caller is speaking {name}. Reply only in natural, spoken {name}, "
+        f"in its usual script. If the caller switches to another language, switch with them."
+    )
+
+
+# Never speak a stray "SEARCH: ..." line if the model writes one.
+_SEARCH_MARKER = re.compile(r"SEARCH\s*:\s*[^\n]*", re.I)
+
+
+def strip_search_lines(reply: str) -> str:
+    return _SEARCH_MARKER.sub("", reply or "").strip()
+
+
+_CALLER_GENDER_HI = {
+    "male": " कॉलर पुरुष लगते हैं; उन्हें सम्मान से 'आप' कहें।",
+    "female": " कॉलर महिला लगती हैं; उन्हें सम्मान से 'आप' कहें।",
 }
 
 
@@ -102,46 +125,97 @@ def build_system_prompt(
     caller_context: str | None = None,
     caller_number: str | None = None,
     caller_name: str | None = None,
-    session_id: str | None = None,
+    web_context: str | None = None,
 ) -> str:
     g = agent_gender if agent_gender in ("male", "female", "neutral") else "neutral"
-    # General bot: neutral grammar + warm female TTS — same prompt for neutral and female.
-    use_conversation = g in ("neutral", "female")
     if reply_lang == "hi":
-        if use_conversation:
-            system = SYSTEM_PROMPT_HI_CONVERSATION
-        else:
-            system = SYSTEM_PROMPT_HI_MALE
-        system += HINDI_SESSION_NUDGE
-        if use_conversation:
-            system += VOICE_NEUTRAL_GRAMMAR_NUDGE_HI
+        system = _PHONE_AGENT_CORE_HI + _PERSONA_HI[g]
         cg = caller_grammar_gender if caller_grammar_gender in ("male", "female") else None
-        if cg and use_conversation and cg in _CALLER_GRAMMAR_NUDGE:
-            system += _CALLER_GRAMMAR_NUDGE[cg]
-    elif use_conversation:
-        system = SYSTEM_PROMPT_EN_CONVERSATION + VOICE_NEUTRAL_GRAMMAR_NUDGE_EN
-    elif g == "male":
-        system = SYSTEM_PROMPT_EN_MALE
+        if cg:
+            system += _CALLER_GENDER_HI[cg]
+    elif reply_lang == "en":
+        system = _PHONE_AGENT_CORE_EN + _PERSONA_EN[g] + _reply_language_rule("en")
     else:
-        system = SYSTEM_PROMPT_EN_CONVERSATION
+        # Any other caller language: English instructions, reply in their language.
+        system = _PHONE_AGENT_CORE_EN + _PERSONA_OTHER[g] + _reply_language_rule(reply_lang)
 
-    if caller_context:
-        system += (
-            " Remember what was said earlier on this call. Caller: "
-            + caller_context
-            + "."
-        )
-    elif caller_number:
-        system += (
-            " Caller id "
-            + caller_number
-            + " — do not read digits aloud unless asked."
-        )
     if caller_name and caller_name not in ("-", "unknown"):
-        system += f" Caller name may be {caller_name}."
-    if session_id:
-        system += f" (session {session_id}, internal only.)"
+        system += f" The caller's name may be {caller_name}."
+    if caller_context:
+        system += f" Caller info (do not read out): {caller_context}."
+    elif caller_number:
+        system += f" Caller id {caller_number} (do not read digits aloud unless asked)."
+    if web_context:
+        system += (
+            " Use the fresh facts below as if you simply know them: answer directly, "
+            "and do not say you searched, looked it up, or checked online."
+        )
+        system += web_context
     return system
+
+
+_WEB_LOOKUP_SYSTEM = (
+    "You decide whether a phone assistant must search the web before answering the caller's "
+    "latest message. Search if the caller wants a specific fact that is time-sensitive or that "
+    "a small assistant could easily get wrong: prices, exchange rates, opening hours, schedules, "
+    "flight or travel times, distances, populations, statistics, news, sports results, election "
+    "results, business or contact details, product specifications, recent events, or who "
+    "currently holds a position. Do not search for greetings, small talk, opinions, advice, "
+    "how-to help, creative writing, simple common knowledge, or anything about the caller "
+    "themselves. Only search when the caller is asking for information now; a statement "
+    "about their plans or life (\"I'm going to Goa next week\") is not a request.\n"
+    "Reply with only NO, or with one line: SEARCH: <short English web search query>. "
+    "Use the conversation to make the query complete."
+)
+_LOOKUP_QUERY = re.compile(r"SEARCH\s*:\s*([^\n]+)", re.I)
+
+
+async def web_lookup_query(
+    *,
+    base_url: str,
+    api_key: str,
+    model: str,
+    user_text: str,
+    history: list[dict],
+    timeout_seconds: float = 5.0,
+    context_messages: int = 4,
+) -> str | None:
+    """
+    Ask the model whether this turn needs a web lookup (cheap: a few tokens, ~0.15 s).
+
+    Returns a context-complete search query (e.g. "flight time from Dar es Salaam to
+    India" for "how long will the flight take?"), or None when no search is needed.
+    """
+    lines = []
+    for msg in history[-context_messages:]:
+        role = msg.get("role")
+        content = re.sub(r"\s+", " ", (msg.get("content") or "").strip())
+        if role in ("user", "assistant") and content:
+            lines.append(f"{'Caller' if role == 'user' else 'Assistant'}: {content[:300]}")
+    prompt = f"Caller's latest message: {user_text}"
+    if lines:
+        prompt = "Conversation so far:\n" + "\n".join(lines) + "\n\n" + prompt
+    client = _client(
+        base_url=base_url,
+        api_key=api_key,
+        timeout_seconds=timeout_seconds,
+        connect_timeout_seconds=min(3.0, timeout_seconds),
+    )
+    resp = await client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": _WEB_LOOKUP_SYSTEM},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.0,
+        max_tokens=32,
+    )
+    out = (resp.choices[0].message.content or "").strip() if resp.choices else ""
+    m = _LOOKUP_QUERY.search(out)
+    if not m:
+        return None
+    query = m.group(1).strip().strip("<>\"'`*.").strip()
+    return query[:120] or None
 
 
 async def check_vllm_reachable(
@@ -167,6 +241,28 @@ async def check_vllm_reachable(
         return False
 
 
+def _alternating_history(history: list[dict], cap: int) -> list[dict]:
+    """
+    Chat templates (Gemma especially) expect user/assistant turns to alternate and to
+    start with the user. A call starts with the bot greeting and can have back-to-back
+    bot lines (greeting + language question, retry prompts); without this the model
+    loses the thread and "restarts" the call.
+    """
+    merged: list[dict] = []
+    for msg in history[-cap:]:
+        role = msg.get("role")
+        content = (msg.get("content") or "").strip()
+        if role not in ("user", "assistant") or not content:
+            continue
+        if merged and merged[-1]["role"] == role:
+            merged[-1] = {"role": role, "content": merged[-1]["content"] + " " + content}
+        else:
+            merged.append({"role": role, "content": content})
+    if merged and merged[0]["role"] == "assistant":
+        merged.insert(0, {"role": "user", "content": "(call connected)"})
+    return merged
+
+
 def _chat_messages(
     *,
     reply_lang: str,
@@ -175,12 +271,12 @@ def _chat_messages(
     caller_context: str | None,
     caller_number: str | None,
     caller_name: str | None,
-    session_id: str | None,
+    web_context: str | None,
     history: list[dict],
     user_text: str,
     max_history_messages: int,
 ) -> tuple[str, list[dict]]:
-    lang = reply_lang if reply_lang in ("hi", "en") else "hi"
+    lang = (reply_lang or "hi").strip().lower() or "hi"
     gender = agent_gender if agent_gender in ("male", "female", "neutral") else "neutral"
     system = build_system_prompt(
         reply_lang=lang,
@@ -189,11 +285,13 @@ def _chat_messages(
         caller_context=caller_context,
         caller_number=caller_number,
         caller_name=caller_name,
-        session_id=session_id,
+        web_context=web_context,
     )
-    cap = max(2, max_history_messages)
-    messages = [{"role": "system", "content": system}]
-    messages.extend(history[-cap:])
+    turns = _alternating_history(history, max(2, max_history_messages))
+    if turns and turns[-1]["role"] == "user":
+        # Previous caller turn got no reply (e.g. error); fold it into this one.
+        user_text = turns.pop()["content"] + " " + user_text
+    messages = [{"role": "system", "content": system}, *turns]
     messages.append({"role": "user", "content": user_text})
     return lang, messages
 
@@ -219,7 +317,7 @@ async def reply_text(
     caller_number: str | None = None,
     caller_name: str | None = None,
     caller_context: str | None = None,
-    session_id: str | None = None,
+    web_context: str | None = None,
     max_history_messages: int = 20,
     timeout_seconds: float = 120.0,
     connect_timeout_seconds: float = 15.0,
@@ -239,7 +337,7 @@ async def reply_text(
         caller_context=caller_context,
         caller_number=caller_number,
         caller_name=caller_name,
-        session_id=session_id,
+        web_context=web_context,
         history=history,
         user_text=user_text,
         max_history_messages=max_history_messages,
@@ -270,7 +368,7 @@ async def reply_text_stream(
     caller_number: str | None = None,
     caller_name: str | None = None,
     caller_context: str | None = None,
-    session_id: str | None = None,
+    web_context: str | None = None,
     max_history_messages: int = 20,
     timeout_seconds: float = 120.0,
     connect_timeout_seconds: float = 15.0,
@@ -296,7 +394,7 @@ async def reply_text_stream(
         caller_context=caller_context,
         caller_number=caller_number,
         caller_name=caller_name,
-        session_id=session_id,
+        web_context=web_context,
         history=history,
         user_text=user_text,
         max_history_messages=max_history_messages,
