@@ -37,6 +37,43 @@ def pick_llm_unavailable_phrase(lang: str = "hi") -> str:
     return random.choice(_LLM_UNAVAILABLE_EN)
 
 
+_INR_AMOUNT = re.compile(r"₹\s*([\d,]+(?:\.\d+)?)")
+# Not after . or word char — avoids v1.2 → v1.दो (only the fractional digit spoken).
+_NUMBER_TOKEN = re.compile(r"(?<![.\w])(\d[\d,]*(?:\.\d+)?)(?![.\w])")
+
+
+def prepare_text_for_tts(text: str, *, lang: str | None = None) -> str:
+    """Numbers and currency as spoken words so phone TTS is clear."""
+    from ari_app.lang import text_contains_devanagari
+    from ari_app.numbers_speak import normalize_digits_in_text, replace_carat_markers, speak_number
+
+    t = normalize_digits_in_text((text or "").strip())
+    if not t:
+        return t
+
+    use_lang = lang or ("hi" if text_contains_devanagari(t) else "en")
+    if use_lang not in ("hi", "en"):
+        # Number words exist only for hi/en; other languages keep digits for the TTS.
+        return re.sub(r"\s+", " ", t).strip()
+    rupee = "रुपये" if use_lang == "hi" else "rupees"
+
+    t = replace_carat_markers(t, lang=use_lang)
+
+    def _inr_sub(m: re.Match[str]) -> str:
+        spoken = speak_number(m.group(1), lang=use_lang)
+        return f"{spoken} {rupee}"
+
+    t = _INR_AMOUNT.sub(_inr_sub, t)
+    t = t.replace("₹", f" {rupee} ")
+
+    def _num_sub(m: re.Match[str]) -> str:
+        return speak_number(m.group(1), lang=use_lang)
+
+    t = _NUMBER_TOKEN.sub(_num_sub, t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
 _SENTENCE_END = re.compile(r'(?<=[.!?।])\s+')
 # Clause breaks when we must shorten without cutting mid-word.
 _CLAUSE_BREAK = re.compile(r'(?<=[,;:—–-])\s+')
@@ -98,17 +135,45 @@ def align_hindi_bot_grammar(text: str, *, grammar_gender: str) -> str:
     return text
 
 
+# Robotic / call-center phrases → shorter spoken wording (phone TTS).
+_ROBOTIC_PHRASE_FIXES: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"\bAs an AI\b", re.I), ""),
+    (re.compile(r"\bI'm an AI\b", re.I), ""),
+    (re.compile(r"\bHow may I assist you(?: today)?\??", re.I), "What can I help with?"),
+    (re.compile(r"\bHow can I assist you(?: today)?\??", re.I), "What do you need?"),
+    (re.compile(r"\bPlease provide the required information\.?", re.I), "What details do you have?"),
+    (re.compile(r"\bCertainly[,!]?\s*", re.I), ""),
+    (re.compile(r"\bI'd be happy to\s+", re.I), ""),
+    (re.compile(r"\bI would be happy to\s+", re.I), ""),
+    (re.compile(r"\bThank you for calling\.?\s*", re.I), ""),
+)
+
+# Only hesitation sounds (TTS renders them as grunts). Acknowledgements like
+# "Okay," / "Got it," / "अच्छा," are kept: they make replies feel connected.
 _LEADING_FILLER_EN = re.compile(
-    r"^(?:(?:"
-    r"(?:oh|ah|uh|um|umm|hmm|hm|mmm|yeah|yep)(?:\s*[,!?.\-—]\s*)|"
-    r"(?:ok|okay|sure|well|so|right|alright)(?:\s*,\s*)|"
-    r"(?:got it|i see|i understand)(?:\s*,\s*)"
-    r"))+",
+    r"^(?:(?:uh|um|umm|erm|er|hmm|hm|mmm)(?:\s*[,!?.\-—…]\s*))+",
     re.IGNORECASE,
 )
 _LEADING_FILLER_HI = re.compile(
-    r"^(?:(?:ओह|अह|अरे|ह्म्म|हम्म|हां|हाँ|अच्छा|ठीक)(?:\s*[,!?।\-—]\s*))+",
+    r"^(?:(?:अह|ह्म्म|हम्म|उम्म)(?:\s*[,!?।\-—…]\s*))+",
 )
+_EMOJI = re.compile(
+    "[\U0001F300-\U0001FAFF\U00002600-\U000027BF\U0001F000-\U0001F2FF️‍]+"
+)
+_PLACEHOLDER = re.compile(r"\[[^\]]{1,40}\]")
+
+
+def strip_robotic_phrases(text: str) -> str:
+    """Rewrite common LLM/call-center wording into conversational speech."""
+    t = _PLACEHOLDER.sub("", _EMOJI.sub("", text or "")).strip()
+    if not t:
+        return t
+    for pattern, repl in _ROBOTIC_PHRASE_FIXES:
+        t = pattern.sub(repl, t)
+    t = re.sub(r"\s+", " ", t).strip()
+    t = re.sub(r"\s+([,.!?।])", r"\1", t)
+    t = re.sub(r"^[,.\s]+", "", t)
+    return t
 
 
 def strip_leading_filler(text: str) -> str:
@@ -132,7 +197,7 @@ def trim_reply_for_phone(
     max_chars: int = 220,
 ) -> str:
     """Keep LLM output short enough for a natural phone turn."""
-    t = strip_leading_filler(text or "")
+    t = strip_robotic_phrases(strip_leading_filler(text or ""))
     t = re.sub(r"[*_#`]+", "", t)
     t = re.sub(r"\s+", " ", t).strip()
     if not t:

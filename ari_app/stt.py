@@ -144,7 +144,11 @@ def _wav_pcm_info(path: Path) -> tuple[int, int, int] | None:
         return None
 
 
-def _whisper_transcribe_kwargs(*, language: str | None) -> dict[str, Any]:
+def _whisper_transcribe_kwargs(
+    *,
+    language: str | None,
+    initial_prompt: str | None = None,
+) -> dict[str, Any]:
     """Phone-tuned faster-whisper settings (medium model + beam_size=1)."""
     kwargs: dict[str, Any] = {
         "beam_size": max(1, _int_env("WHISPER_BEAM_SIZE", 1)),
@@ -153,16 +157,20 @@ def _whisper_transcribe_kwargs(*, language: str | None) -> dict[str, Any]:
         "condition_on_previous_text": False,
         "without_timestamps": True,
         "vad_filter": _bool_env("WHISPER_VAD_FILTER", True),
-        "no_speech_threshold": _float_env("WHISPER_NO_SPEECH_THRESHOLD", 0.55),
+        "no_speech_threshold": _float_env("WHISPER_NO_SPEECH_THRESHOLD", 0.5),
         "compression_ratio_threshold": 2.4,
         "log_prob_threshold": -1.0,
     }
     if language:
         kwargs["language"] = language
+    if initial_prompt and initial_prompt.strip():
+        kwargs["initial_prompt"] = initial_prompt.strip()
     if kwargs["vad_filter"]:
+        # Smaller min_silence so short replies (yes/no/haan/nahi) survive VAD;
+        # smaller speech_pad so we trim less leading/trailing silence into segments.
         kwargs["vad_parameters"] = {
-            "min_silence_duration_ms": _int_env("WHISPER_VAD_MIN_SILENCE_MS", 400),
-            "speech_pad_ms": 80,
+            "min_silence_duration_ms": _int_env("WHISPER_VAD_MIN_SILENCE_MS", 250),
+            "speech_pad_ms": _int_env("WHISPER_VAD_SPEECH_PAD_MS", 60),
         }
     return kwargs
 
@@ -197,13 +205,17 @@ def _transcribe_sync_on_device(
     device: str,
     compute_type: str,
     language: str | None,
-) -> tuple[str, str | None]:
+    *,
+    initial_prompt: str | None = None,
+) -> tuple[str, str | None, float | None]:
     from ari_app.inference_pool import run_whisper
 
     model = _get_model(model_name, device, compute_type)
 
-    def _do_transcribe() -> tuple[str, str | None]:
-        kwargs = _whisper_transcribe_kwargs(language=language)
+    def _do_transcribe() -> tuple[str, str | None, float | None]:
+        kwargs = _whisper_transcribe_kwargs(
+            language=language, initial_prompt=initial_prompt
+        )
         segments, info = model.transcribe(str(wav_16k), **kwargs)
         parts: list[str] = []
         for seg in segments:
@@ -211,11 +223,15 @@ def _transcribe_sync_on_device(
             if t:
                 parts.append(t)
         detected: str | None = None
+        prob: float | None = None
         if language is None and info is not None:
             raw = getattr(info, "language", None)
             if raw:
                 detected = str(raw).strip().lower()[:2]
-        return " ".join(parts).strip(), detected
+            raw_prob = getattr(info, "language_probability", None)
+            if raw_prob is not None:
+                prob = float(raw_prob)
+        return " ".join(parts).strip(), detected, prob
 
     return run_whisper(_do_transcribe)
 
@@ -226,11 +242,18 @@ def _transcribe_sync(
     device: str,
     compute_type: str,
     language: str | None,
-) -> tuple[str, str | None]:
+    *,
+    initial_prompt: str | None = None,
+) -> tuple[str, str | None, float | None]:
     _maybe_warn_en_model(model_name, language)
     try:
         return _transcribe_sync_on_device(
-            wav_16k, model_name, device, compute_type, language
+            wav_16k,
+            model_name,
+            device,
+            compute_type,
+            language,
+            initial_prompt=initial_prompt,
         )
     except RuntimeError as exc:
         if device != "cuda" or not _cuda_runtime_broken(exc):
@@ -242,7 +265,12 @@ def _transcribe_sync(
             exc,
         )
         return _transcribe_sync_on_device(
-            wav_16k, model_name, "cpu", "int8", language
+            wav_16k,
+            model_name,
+            "cpu",
+            "int8",
+            language,
+            initial_prompt=initial_prompt,
         )
 
 
@@ -251,10 +279,15 @@ async def transcribe_wav(
     whisper_model: str,
     *,
     language: str | None = None,
-) -> tuple[str, str | None]:
-    """Returns (transcript, whisper_detected_lang or None when language is forced)."""
+    initial_prompt: str | None = None,
+) -> tuple[str, str | None, float | None]:
+    """
+    Returns (transcript, detected_lang, language_probability).
+
+    When the language is forced, detected_lang is that language and probability is None.
+    """
     if not wav_path.is_file():
-        return "", None
+        return "", None, None
 
     device = _whisper_device()
     compute_type = _whisper_compute_type(device)
@@ -276,15 +309,20 @@ async def transcribe_wav(
         from ari_app.inference_pool import get_executor
 
         loop = asyncio.get_running_loop()
-        text, detected = await loop.run_in_executor(
+        text, detected, prob = await loop.run_in_executor(
             get_executor(),
             lambda: _transcribe_sync(
-                transcribe_path, whisper_model, device, compute_type, language
+                transcribe_path,
+                whisper_model,
+                device,
+                compute_type,
+                language,
+                initial_prompt=initial_prompt,
             ),
         )
         if language:
             detected = language[:2].lower()
-        return text, detected
+        return text, detected, prob
     finally:
         if tmp_path is not None:
             tmp_path.unlink(missing_ok=True)

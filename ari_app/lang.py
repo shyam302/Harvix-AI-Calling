@@ -58,7 +58,6 @@ _ROMAN_HI_WORDS = frozenset(
         "hun",
         "tha",
         "thi",
-        "the",
         "mera",
         "meri",
         "mere",
@@ -117,6 +116,10 @@ _EXPLICIT_EN_PHRASES = frozenset(
         "english me",
         "angrezi mein",
         "angrezi me",
+        "change to english",
+        "switch language to english",
+        "language english",
+        "english language",
     }
 )
 
@@ -147,6 +150,14 @@ _EXPLICIT_HI_PHRASES = frozenset(
         "hindi me",
         "in hindhi",
         "talk in hindhi",
+        "change to hindi",
+        "switch language to hindi",
+        "language hindi",
+        "hindi language",
+        "bolo hindi",
+        "hindi bolo",
+        "hindi me baat karo",
+        "hindi mein baat karo",
     }
 )
 
@@ -196,29 +207,49 @@ def _latin_words(text: str) -> list[str]:
     return re.findall(r"[a-zA-Z']+", (text or "").lower())
 
 
+# Latin words that are normal English — do not count as Romanized Hindi.
+_ENGLISH_COMMON = frozenset(
+    {
+        "the", "a", "an", "is", "are", "was", "were", "in", "on", "at", "to", "for",
+        "of", "and", "or", "but", "not", "this", "that", "what", "when", "where",
+        "who", "how", "why", "which", "with", "from", "by", "as", "it", "its", "i",
+        "you", "he", "she", "we", "they", "my", "your", "his", "her", "our", "their",
+        "me", "him", "us", "them", "do", "does", "did", "have", "has", "had", "will",
+        "would", "can", "could", "should", "may", "might", "be", "been", "being", "am",
+        "please", "thanks", "thank", "hello", "hi", "bye", "today", "tomorrow",
+        "yesterday", "gold", "silver", "rate", "price", "india", "live", "search",
+        "tell", "know", "want", "need", "help", "about", "per", "gram", "grams",
+    }
+)
+
+
 def _roman_hindi_score(text: str) -> int:
     words = _latin_words(text)
     if not words:
         return 0
-    return sum(1 for w in words if w in _ROMAN_HI_WORDS)
+    return sum(
+        1
+        for w in words
+        if w in _ROMAN_HI_WORDS and w not in _ENGLISH_COMMON
+    )
 
 
 def _devanagari_english_intent(text: str) -> bool:
+    """Devanagari request for English — no calls to looks_like_* (avoids recursion)."""
     if not text_contains_devanagari(text):
         return False
-    return bool(_DEVANAGARI_ENGLISH_RE.search(text)) and bool(
-        _DEVANAGARI_SPEAK_RE.search(text)
-    )
+    return bool(_DEVANAGARI_ENGLISH_RE.search(text))
 
 
 def _devanagari_hindi_intent(text: str) -> bool:
+    """Devanagari request for Hindi — no calls to looks_like_* (avoids recursion)."""
     if not text_contains_devanagari(text):
         return False
-    if _devanagari_english_intent(text):
+    if _DEVANAGARI_ENGLISH_RE.search(text) and not _DEVANAGARI_HINDI_RE.search(text):
         return False
-    return bool(_DEVANAGARI_HINDI_RE.search(text)) and bool(
-        _DEVANAGARI_SPEAK_RE.search(text)
-    )
+    if _DEVANAGARI_HINDI_RE.search(text):
+        return True
+    return bool(_DEVANAGARI_SPEAK_RE.search(text))
 
 
 def _latin_hindi_intent(phrase: str) -> bool:
@@ -324,98 +355,108 @@ def _is_short_english_utterance(text: str) -> bool:
     return all(w in _SHORT_EN_KEEP_HI for w in words)
 
 
-def clear_english_switch(
+def is_latin_english_content(
     text: str,
     *,
-    whisper_lang: str | None = None,
-    min_en_words: int = 4,
+    min_words: int = 2,
 ) -> bool:
-    """
-    Strong signal the caller switched to English (not Whisper noise on a Hindi call).
-    Requires enough English words; ignores short 'ok/yes/thanks' and Romanized Hindi.
-    """
+    """Latin script, no Romanized-Hindi vocabulary — real English (not Whisper lang tag)."""
     if is_explicit_hindi_intent(text):
         return False
     if text_contains_devanagari(text):
         return False
-    if looks_like_hindi(text, whisper_lang=whisper_lang):
-        return False
-    if _is_short_english_utterance(text):
-        return False
     words = _latin_words(text)
-    if len(words) < min_en_words:
+    if len(words) < min_words:
         return False
     if _roman_hindi_score(text) > 0:
-        return False
-    wl = (whisper_lang or "").strip().lower()[:2]
-    if wl == "en" and len(words) >= max(2, min_en_words - 1):
-        return True
-    if wl and wl not in ("en",):
         return False
     return True
 
 
-def detect_turn_lang(
+# Languages Supertonic-3 can speak; anything else uses its language-agnostic "na" mode.
+SUPERTONIC_LANGS = frozenset(
+    "en ko ja ar bg cs da de el es et fi fr hi hr hu id it lt lv nl pl pt ro ru sk sl sv "
+    "tr uk vi".split()
+)
+
+LANGUAGE_NAMES: dict[str, str] = {
+    "en": "English", "hi": "Hindi", "mr": "Marathi", "bn": "Bengali", "ta": "Tamil",
+    "te": "Telugu", "gu": "Gujarati", "kn": "Kannada", "ml": "Malayalam", "pa": "Punjabi",
+    "ur": "Urdu", "ne": "Nepali", "or": "Odia", "as": "Assamese", "sa": "Sanskrit",
+    "es": "Spanish", "fr": "French", "de": "German", "it": "Italian", "pt": "Portuguese",
+    "nl": "Dutch", "ru": "Russian", "uk": "Ukrainian", "pl": "Polish", "cs": "Czech",
+    "sk": "Slovak", "sl": "Slovenian", "hr": "Croatian", "bg": "Bulgarian", "ro": "Romanian",
+    "hu": "Hungarian", "el": "Greek", "tr": "Turkish", "ar": "Arabic", "fa": "Persian",
+    "he": "Hebrew", "sv": "Swedish", "da": "Danish", "no": "Norwegian", "fi": "Finnish",
+    "et": "Estonian", "lv": "Latvian", "lt": "Lithuanian", "ja": "Japanese", "ko": "Korean",
+    "zh": "Chinese", "vi": "Vietnamese", "th": "Thai", "id": "Indonesian", "ms": "Malay",
+    "tl": "Tagalog", "sw": "Swahili",
+}
+
+# Whisper often tags spoken Hindi as Urdu (same spoken language); reply in Hindi.
+_WHISPER_LANG_ALIASES = {"ur": "hi"}
+
+# "speak in Spanish", "can you talk French", "switch to German please"
+_LANG_REQUEST_VERBS = r"(speak|talk|reply|respond|answer|switch|continue|change)"
+
+
+def language_name(code: str) -> str:
+    return LANGUAGE_NAMES.get(code, code)
+
+
+def _explicit_language_request(text: str) -> str | None:
+    """Caller asks (in Latin script) for a specific language by name."""
+    phrase = _normalized_phrase(text)
+    if not phrase or not re.search(rf"\b{_LANG_REQUEST_VERBS}\b", phrase):
+        return None
+    for code, name in LANGUAGE_NAMES.items():
+        if re.search(rf"\b{name.lower()}\b", phrase):
+            return code
+    return None
+
+
+def detect_reply_lang(
     text: str,
     *,
-    whisper_lang: str | None = None,
-    primary_lang: str = "hi",
-) -> str:
-    if looks_like_hindi(text, whisper_lang=whisper_lang):
-        return "hi"
-    if clear_english_switch(text, whisper_lang=whisper_lang):
-        return "en"
-    return primary_lang if primary_lang in ("hi", "en") else "hi"
-
-
-def update_preferred_lang(
+    whisper_lang: str | None,
+    whisper_prob: float | None,
     current: str,
-    user_text: str,
-    *,
-    whisper_lang: str | None = None,
-    primary_lang: str = "hi",
-    consecutive_en_signals: int = 0,
-    min_en_words: int = 4,
-    consecutive_en_required: int = 2,
-) -> tuple[str, int]:
+    min_words: int = 2,
+    min_prob: float = 0.6,
+) -> str:
     """
-    Sticky session language with hysteresis.
+    Language the bot should answer this turn in: whatever the caller is speaking.
 
-    - Hindi call (primary hi): stay on hi unless English is clear for several turns.
-    - One Hindi/Devanagari/Roman-Hindi utterance immediately returns to hi.
-    - Explicit English ("continue", "speak english") switches immediately.
-    - Explicit Hindi ("talk in hindi") switches immediately, even if spoken in English.
+    Sticky on weak evidence (one-word acks like "ok" / "haan", low Whisper
+    confidence) so a single misdetection does not flip the call's language.
     """
-    if is_explicit_hindi_intent(user_text):
-        return "hi", 0
+    if is_explicit_hindi_intent(text):
+        return "hi"
+    if is_explicit_english_intent(text):
+        return "en"
+    requested = _explicit_language_request(text)
+    if requested:
+        return requested
 
-    if is_explicit_english_intent(user_text):
-        return "en", 0
+    wl = (whisper_lang or "").strip().lower()[:2] or None
+    wl = _WHISPER_LANG_ALIASES.get(wl, wl) if wl else None
 
-    if looks_like_hindi(user_text, whisper_lang=whisper_lang):
-        return "hi", 0
+    if text_contains_devanagari(text):
+        # Marathi / Nepali also use Devanagari; otherwise Hindi.
+        return wl if wl in ("mr", "ne") else "hi"
+    if wl in (None, "hi") and looks_like_hindi(text, whisper_lang=wl):
+        return "hi"  # Romanized Hindi / Hinglish
+    if not wl or wl == current:
+        return current
 
-    if clear_english_switch(
-        user_text, whisper_lang=whisper_lang, min_en_words=min_en_words
-    ):
-        consecutive_en_signals += 1
-    else:
-        consecutive_en_signals = 0
-
-    if primary_lang == "hi":
-        if current == "en":
-            # Stay in English through short replies until Hindi is detected (explicit or content).
-            return "en", consecutive_en_signals
-        if consecutive_en_signals >= consecutive_en_required:
-            return "en", consecutive_en_signals
-        return "hi", consecutive_en_signals
-
-    # Primary English: switch to hi immediately when Hindi detected (above).
-    if consecutive_en_signals > 0 or clear_english_switch(
-        user_text, whisper_lang=whisper_lang, min_en_words=min_en_words
-    ):
-        return "en", 0
-    return current or "en", 0
+    words = len(re.findall(r"\w+", text or ""))
+    if words < min_words:
+        return current
+    if whisper_prob is not None and whisper_prob < min_prob:
+        return current
+    if wl == "en" and _is_short_english_utterance(text):
+        return current
+    return wl
 
 
 def whisper_language_hint(
@@ -439,16 +480,20 @@ def resolve_tts_lang(
     *,
     session_lang: str | None = None,
 ) -> str:
+    """Supertonic language code for this text (any call language, not only hi/en)."""
     if text_contains_devanagari(text):
         return "hi"
-    if session_lang == "en":
-        return "en"
-    if session_lang == "hi":
-        # Latin-only text (e.g. English opening) uses English TTS; Devanagari uses hi.
+    if session_lang in (None, "", "hi"):
+        # Latin-only text (e.g. English fallback line) uses English TTS; else Hindi.
         if _latin_words(text) and _roman_hindi_score(text) == 0:
             return "en"
-        return "hi"
-    return "hi" if looks_like_hindi(text) else "en"
+        return "hi" if looks_like_hindi(text) or session_lang == "hi" else "en"
+    if session_lang in SUPERTONIC_LANGS:
+        return session_lang
+    # Language Supertonic was not trained on (Tamil, Bengali, ...).
+    if re.fullmatch(r"[\sA-Za-z0-9'\".,!?;:()\-—]+", text or ""):
+        return "en"
+    return "na"
 
 
 def reply_should_be_devanagari(reply: str, reply_lang: str) -> bool:

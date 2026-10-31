@@ -22,6 +22,7 @@ from ari_app.call_session import (
 )
 from ari_app.config import load_settings
 from ari_app.inference_pool import configure as configure_inference_pool
+from ari_app.live_vad import INTERNAL_CHANNEL_PREFIXES
 from ari_app.stt import whisper_runtime_info
 
 log = logging.getLogger("ari_callbot")
@@ -72,6 +73,8 @@ async def run_ari_forever() -> None:
             cid = ch.get("id")
             if not cid:
                 return
+            if cid.startswith(INTERNAL_CHANNEL_PREFIXES):
+                return  # snoop / externalMedia helper of an existing call (live VAD)
             caller_number, caller_name, dialed = stasis_channel_peer_info(ch)
             ctx = CallContext.create(
                 channel_id=cid,
@@ -90,6 +93,7 @@ async def run_ari_forever() -> None:
                 agent_gender=settings.agent_gender,
                 agent_voice_gender=settings.agent_voice_gender,
                 grammar_match_voice=settings.grammar_match_voice,
+                hindi_grammar_use_agent_persona=settings.hindi_grammar_use_agent_persona,
                 gender_grammar_until_confident=settings.gender_grammar_until_confident,
                 gender_grammar_min_turns=settings.gender_grammar_min_turns,
             )
@@ -162,13 +166,14 @@ async def run_ari_forever() -> None:
 
     log.info(
         "ARI WebSocket app=%s sounds_en=%s vLLM=%s whisper=%s lang=%s model=%s "
-        "tts=supertonic voice_en=%s voice_hi=%s concurrent_whisper=%s concurrent_tts=%s",
+        "tts=%s voice_en=%s voice_hi=%s concurrent_whisper=%s concurrent_tts=%s",
         settings.stasis_app,
         sounds_en,
         settings.vllm_base_url,
         whisper_runtime_info(),
         settings.whisper_language or "auto",
         settings.whisper_model,
+        settings.tts_backend,
         settings.tts_voice,
         settings.tts_voice_hi or "(same as en)",
         settings.whisper_max_concurrent,

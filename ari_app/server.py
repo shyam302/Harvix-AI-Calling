@@ -8,6 +8,7 @@ import logging
 import os
 import sys
 from collections.abc import AsyncIterator
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
@@ -17,6 +18,8 @@ from ari_app.config import load_settings
 from ari_app.llm import check_vllm_reachable
 from ari_app.inference_pool import configure as configure_inference_pool
 from ari_app.inference_pool import pool_status, shutdown as shutdown_inference_pool
+from ari_app.gender_model import warmup_gender_model
+from ari_app.live_vad import warmup_vad
 from ari_app.stt import warmup_whisper
 from ari_app.tts import warmup_supertonic
 
@@ -34,6 +37,34 @@ def _configure_logging() -> None:
         root = logging.getLogger()
         if not root.handlers:
             logging.basicConfig(level=level, format=fmt, stream=sys.stderr)
+
+    # Optional copy of the console feed on disk (LOG_FILE=logs/callbot.log).
+    log_file = (os.getenv("LOG_FILE") or "").strip()
+    if log_file:
+        from logging.handlers import RotatingFileHandler
+
+        path = Path(log_file)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handler = RotatingFileHandler(
+            path, maxBytes=5_000_000, backupCount=3, encoding="utf-8"
+        )
+        handler.setFormatter(logging.Formatter(fmt))
+        logging.getLogger().addHandler(handler)
+
+    # Quiet third-party noise that doesn't belong in the per-call console feed.
+    for noisy in (
+        "httpx",
+        "httpcore",
+        "ddgs",
+        "ddgs.ddgs",
+        "primp",
+        "duckduckgo_search",
+        "crawl4ai",
+        "openai",
+        "urllib3",
+        "asyncio",
+    ):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
 @contextlib.asynccontextmanager
@@ -53,13 +84,22 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     loop = asyncio.get_running_loop()
     def _warmup_models() -> None:
-        warmup_supertonic(
-            voice_en=settings.tts_voice,
-            voice_hi=settings.tts_voice_hi,
-            voice_female=settings.tts_voice_female,
-            voice_male=settings.tts_voice_male,
-        )
+        if settings.tts_backend != "edge":
+            from ari_app.supertonic_onnx import ensure_cuda_library_path
+
+            ensure_cuda_library_path()
+            warmup_supertonic(
+                voice_en=settings.tts_voice,
+                voice_hi=settings.tts_voice_hi,
+                voice_female=settings.tts_voice_female,
+                voice_male=settings.tts_voice_male,
+            )
+        else:
+            log.info("TTS_BACKEND=edge — skipping Supertonic warmup")
         warmup_whisper(model_name=settings.whisper_model)
+        warmup_gender_model(enabled=settings.gender_model_enabled)
+        if settings.vad_enabled:
+            warmup_vad()
 
     await loop.run_in_executor(None, _warmup_models)
 
