@@ -397,7 +397,7 @@ LANGUAGE_NAMES: dict[str, str] = {
 _WHISPER_LANG_ALIASES = {"ur": "hi"}
 
 # "speak in Spanish", "can you talk French", "switch to German please"
-_LANG_REQUEST_VERBS = r"(speak|talk|reply|respond|answer|switch|continue|change)"
+_LANG_REQUEST_VERBS = r"(speak|talk|reply|respond|answer|switch|continue|change|stick|use|only)"
 
 
 def language_name(code: str) -> str:
@@ -412,6 +412,22 @@ def _explicit_language_request(text: str) -> str | None:
     for code, name in LANGUAGE_NAMES.items():
         if re.search(rf"\b{name.lower()}\b", phrase):
             return code
+    return None
+
+
+_NAMES_EN = re.compile(r"english|angrez|angrej|अंग्रेज|इंग्लिश|इंग्लीश", re.I)
+_NAMES_HI = re.compile(r"hind|हिंदी|हिन्दी", re.I)
+
+
+def requested_language(text: str) -> str | None:
+    """Language the caller explicitly asked for by name ("English only", "हिंदी में बोलो")."""
+    requested = _explicit_language_request(text)
+    if requested:
+        return requested
+    if is_explicit_hindi_intent(text) and _NAMES_HI.search(text or ""):
+        return "hi"
+    if is_explicit_english_intent(text) and _NAMES_EN.search(text or ""):
+        return "en"
     return None
 
 

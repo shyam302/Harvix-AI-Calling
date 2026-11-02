@@ -8,3 +8,5 @@ Untitled
 .cursor/
 logs/
 *.wav
+knowledge/*
+!knowledge/.gitkeep

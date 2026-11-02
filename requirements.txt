@@ -24,3 +24,8 @@ librosa>=0.10.0
 google-search-results>=2.4.0
 fastapi>=0.115.0
 uvicorn[standard]>=0.30.0
+# Knowledge base (RAG): multilingual embeddings + PDF/DOCX reading + keyword scoring
+sentence-transformers>=3.0.0
+pymupdf>=1.24.0
+python-docx>=1.1.0
+rank-bm25>=0.2.2

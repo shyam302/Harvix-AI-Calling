@@ -100,6 +100,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         warmup_gender_model(enabled=settings.gender_model_enabled)
         if settings.vad_enabled:
             warmup_vad()
+        if settings.rag_enabled:
+            # Load the embedding model and index the knowledge folder before calls.
+            from ari_app.rag import get_knowledge_base
+
+            kb = get_knowledge_base(settings.rag_docs_dir, model_name=settings.rag_embed_model)
+            kb.warmup()
+            log.info("Knowledge base ready: %s chunks from %s", len(kb.chunks), kb.docs_dir)
 
     await loop.run_in_executor(None, _warmup_models)
 

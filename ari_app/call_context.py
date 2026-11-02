@@ -24,6 +24,7 @@ class CallContext:
     messages: list[dict[str, str]] = field(default_factory=list)
     max_messages: int = 20
     preferred_lang: str = "hi"  # any language code — follows the caller, drives LLM + TTS
+    lang_pinned: bool = False  # caller asked for a language by name; stop auto-switching
     caller_gender: str | None = None  # pitch and/or Wav2Vec2 gender model
     caller_gender_confident: bool = False
     caller_gender_model_done: bool = False  # Wav2Vec2 runs at most once per call
@@ -137,10 +138,27 @@ class CallContext:
         min_words: int = 2,
         min_prob: float = 0.6,
     ) -> str:
-        """Follow whatever language the caller is speaking (sticky on weak evidence)."""
-        from ari_app.lang import detect_reply_lang
+        """
+        Follow whatever language the caller is speaking (sticky on weak evidence).
+        Once the caller asks for a language by name, keep it until they ask for another.
+        """
+        from ari_app.lang import detect_reply_lang, requested_language
 
         prev = self.preferred_lang
+        requested = requested_language(user_text)
+        if requested:
+            self.lang_pinned = True
+            self.preferred_lang = requested
+            if requested != prev:
+                log.info(
+                    "Session %s caller asked for %s; language pinned (%r)",
+                    self.session_id,
+                    requested,
+                    (user_text or "")[:80],
+                )
+            return self.preferred_lang
+        if self.lang_pinned:
+            return self.preferred_lang
         self.preferred_lang = detect_reply_lang(
             user_text,
             whisper_lang=whisper_lang,

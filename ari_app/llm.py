@@ -29,6 +29,9 @@ _PHONE_AGENT_CORE_EN = (
     "Match the caller's mood: calm and kind if upset, simpler if confused, cheerful if happy.\n"
     "- If you did not understand, say so briefly and ask them to say it again.\n"
     "- If they thank you or say bye, close warmly in one line.\n"
+    "You can look things up online: when fresh facts are needed, the system searches "
+    "the web and gives you the results, so never say you can't search or have no "
+    "internet access.\n"
     "Never use lists, markdown, emojis, or placeholders like [Your Name]. "
     "Do not say 'How may I assist you' or 'Thank you for calling'. "
     "Do not mention being an AI, a bot, or a model unless the caller asks directly."
@@ -49,6 +52,8 @@ _PHONE_AGENT_CORE_HI = (
     "कॉलर परेशान हो तो नरमी से, उलझन में हो तो आसान शब्दों में, खुश हो तो खुशी से।\n"
     "- बात समझ न आए तो छोटे में बताएँ और दोबारा बोलने को कहें।\n"
     "- धन्यवाद या अलविदा पर एक लाइन में प्यार से बात खत्म करें।\n"
+    "आप ऑनलाइन जानकारी देख सकती/सकते हैं: ज़रूरत होने पर सिस्टम वेब पर खोजकर नतीजे देता है, "
+    "इसलिए कभी न कहें कि आप सर्च नहीं कर सकते या इंटरनेट नहीं है।\n"
     "सूची, मार्कडाउन, इमोजी या [नाम] जैसे खाली निशान न लिखें। "
     "AI, बॉट या मॉडल का ज़िक्र तभी करें जब कॉलर सीधे पूछे। "
     "केवल देवनागरी में बोलचाल की हिंदी लिखें; अंग्रेज़ी के आम शब्द देवनागरी में चल सकते हैं।"
@@ -178,7 +183,8 @@ async def web_lookup_query(
     user_text: str,
     history: list[dict],
     timeout_seconds: float = 5.0,
-    context_messages: int = 4,
+    context_messages: int = 6,
+    force: bool = False,
 ) -> str | None:
     """
     Ask the model whether this turn needs a web lookup (cheap: a few tokens, ~0.15 s).
@@ -193,6 +199,11 @@ async def web_lookup_query(
         if role in ("user", "assistant") and content:
             lines.append(f"{'Caller' if role == 'user' else 'Assistant'}: {content[:300]}")
     prompt = f"Caller's latest message: {user_text}"
+    if force:
+        prompt += (
+            "\nThe caller is asking you to look something up, so reply with a SEARCH "
+            "line. Work out from the conversation what they want found."
+        )
     if lines:
         prompt = "Conversation so far:\n" + "\n".join(lines) + "\n\n" + prompt
     client = _client(

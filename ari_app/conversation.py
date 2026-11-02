@@ -38,6 +38,19 @@ def pick_llm_unavailable_phrase(lang: str = "hi") -> str:
 
 
 _INR_AMOUNT = re.compile(r"₹\s*([\d,]+(?:\.\d+)?)")
+# Phone-like digit runs: "1800 102 4455", "+91 98765 43210", "9876543210".
+_PHONE = re.compile(r"(?<![\w.,])\+?\d[\d \-]{6,}\d(?![\w.,]?\d)")
+_YEAR = re.compile(r"(19|20)\d\d")
+
+
+def _looks_like_phone(raw: str) -> bool:
+    groups = [g for g in re.split(r"[ \-]+", raw.lstrip("+")) if g]
+    digits = sum(len(g) for g in groups)
+    if digits < 8 or digits > 15:
+        return False
+    if all(len(g) == 4 and _YEAR.fullmatch(g) for g in groups):
+        return False  # "2026 2027", not a number to dial
+    return raw.startswith(("+", "0", "1800")) or len(groups) == 1 or len(groups) >= 3
 # Not after . or word char — avoids v1.2 → v1.दो (only the fractional digit spoken).
 _NUMBER_TOKEN = re.compile(r"(?<![.\w])(\d[\d,]*(?:\.\d+)?)(?![.\w])")
 
@@ -59,6 +72,23 @@ def prepare_text_for_tts(text: str, *, lang: str | None = None) -> str:
 
     t = replace_carat_markers(t, lang=use_lang)
 
+    def _phone_sub(m: re.Match[str]) -> str:
+        raw = m.group(0)
+        if not _looks_like_phone(raw):
+            return raw
+        groups = [g for g in re.split(r"[ \-]+", raw.lstrip("+")) if g]
+        if len(groups) == 1 and len(groups[0]) >= 10:  # mobile: speak as 5 + 5
+            g = groups[0]
+            groups = [g[:-5], g[-5:]]
+        spoken = ", ".join(
+            " ".join(speak_number(d, lang=use_lang) for d in g) for g in groups
+        )
+        plus = ("प्लस " if use_lang == "hi" else "plus ") if raw.startswith("+") else ""
+        return f" {plus}{spoken}, "
+
+    # Phone numbers digit by digit, before amounts turn "1800" into "eighteen hundred".
+    t = _PHONE.sub(_phone_sub, t)
+
     def _inr_sub(m: re.Match[str]) -> str:
         spoken = speak_number(m.group(1), lang=use_lang)
         return f"{spoken} {rupee}"
@@ -71,7 +101,8 @@ def prepare_text_for_tts(text: str, *, lang: str | None = None) -> str:
 
     t = _NUMBER_TOKEN.sub(_num_sub, t)
     t = re.sub(r"\s+", " ", t).strip()
-    return t
+    t = re.sub(r",\s*([.!?।,])", r"\1", t)  # "..., ." left after a phone number
+    return t.rstrip(", ")
 
 
 _SENTENCE_END = re.compile(r'(?<=[.!?।])\s+')

@@ -6,6 +6,7 @@ import asyncio
 import logging
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
@@ -215,6 +216,96 @@ class SearchHit:
     title: str
     snippet: str
     link: str
+
+
+_PAGE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-IN,en;q=0.9",
+}
+_STOPWORDS = frozenset(
+    "a an the of to in on for and or is are was were be by with from at as it this that "
+    "what how when where who which do does can i you me my your about current today now "
+    "tell please".split()
+)
+_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
+
+
+def _query_terms(query: str) -> set[str]:
+    return {
+        w for w in re.findall(r"[a-z0-9]+", (query or "").lower())
+        if len(w) > 2 and w not in _STOPWORDS
+    }
+
+
+def _best_passage(text: str, terms: set[str], *, max_chars: int = 450) -> str:
+    """Sentences that mention the most query terms, kept in page order."""
+    sentences = [
+        s.strip() for s in _SENTENCE_SPLIT.split(text) if 30 <= len(s.strip()) <= 400
+    ]
+    need = 2 if len(terms) >= 3 else 1  # one shared word is usually boilerplate
+    scored = []
+    for i, sent in enumerate(sentences):
+        words = set(re.findall(r"[a-z0-9]+", sent.lower()))
+        score = len(terms & words)
+        if score >= need:
+            scored.append((score, i, sent))
+    if not scored:
+        return ""
+    top = sorted(scored, key=lambda x: (-x[0], x[1]))[:4]
+    out = ""
+    for _, _, sent in sorted(top, key=lambda x: x[1]):
+        if len(out) + len(sent) + 1 > max_chars:
+            break
+        out = f"{out} {sent}".strip()
+    return out
+
+
+async def _page_passage(
+    client: httpx.AsyncClient, hit: SearchHit, terms: set[str]
+) -> str:
+    try:
+        r = await client.get(hit.link)
+        if r.status_code != 200 or "html" not in r.headers.get("content-type", ""):
+            return ""
+        html = r.text[:1_500_000]
+    except (httpx.HTTPError, UnicodeDecodeError):
+        return ""
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup(["script", "style", "noscript", "nav", "header", "footer", "aside", "form"]):
+        tag.decompose()
+    text = re.sub(r"\s+", " ", soup.get_text(" "))
+    return _best_passage(text, terms)
+
+
+async def read_top_pages(
+    hits: list[SearchHit],
+    query: str,
+    *,
+    max_pages: int = 2,
+    timeout_seconds: float = 2.0,
+) -> list[str]:
+    """
+    Fetch the top result pages in parallel and pull the sentences that answer the
+    query. Search snippets are often teasers ("find out how to ..."); this gives
+    the model the actual facts. Pages that are slow or blocked are skipped.
+    """
+    terms = _query_terms(query)
+    targets = [h for h in hits if h.link.startswith("http")][:max_pages]
+    if not terms or not targets:
+        return []
+    timeout = httpx.Timeout(timeout_seconds, connect=min(1.0, timeout_seconds))
+    async with httpx.AsyncClient(
+        headers=_PAGE_HEADERS, timeout=timeout, follow_redirects=True
+    ) as client:
+        results = await asyncio.gather(
+            *(_page_passage(client, h, terms) for h in targets), return_exceptions=True
+        )
+    return [r for r in results if isinstance(r, str) and r]
 
 
 def is_google_configured(*, api_key: str, cx: str) -> bool:
@@ -504,7 +595,13 @@ def _cricket_summary_from_hits(hits: list[SearchHit]) -> tuple[list[str], list[s
     return live[:5], upcoming[:6]
 
 
-def format_context_for_llm(hits: list[SearchHit], *, query: str, topic: str = "general") -> str:
+def format_context_for_llm(
+    hits: list[SearchHit],
+    *,
+    query: str,
+    topic: str = "general",
+    passages: list[str] | None = None,
+) -> str:
     if not hits:
         return (
             " A web search returned no useful live snippets. Apologize briefly in one "
@@ -582,6 +679,8 @@ def format_context_for_llm(hits: list[SearchHit], *, query: str, topic: str = "g
     for i, h in enumerate(hits, 1):
         bit = f"{i}. {h.title}: {h.snippet}"
         lines.append(bit[:280])
+    for passage in passages or []:
+        lines.append(" From the page: " + passage)
     lines.append(f" (query: {query[:80]})")
     return " " + " ".join(lines)
 
@@ -599,12 +698,21 @@ def _hits_from_ddg_rows(rows: list[dict[str, Any]], *, limit: int) -> list[Searc
     return hits
 
 
+# Engine tiers, tried in order. DuckDuckGo is fastest (~1 s) but rate-limits
+# bursts; when it is throttled it fails in ~0.3 s and Yahoo/Yandex answer in
+# ~1.5 s. Engines that are slow to fail (brave, mojeek, startpage, google) are
+# last. wikipedia/grokipedia are never used: useless for live facts.
+_ENGINE_TIERS = ("duckduckgo", "yahoo,yandex", "brave,mojeek,startpage,google")
+_preferred_tier = 0  # tier that answered last; tried first next time
+
+
 def _ddg_text_sync(
     q: str,
     *,
     max_results: int,
     timeout_seconds: float,
 ) -> list[dict[str, Any]]:
+    global _preferred_tier
     try:
         from ddgs import DDGS
     except ImportError:
@@ -613,22 +721,32 @@ def _ddg_text_sync(
         except ImportError:
             log.warning("Install ddgs: pip install ddgs")
             return []
-    try:
-        with DDGS(timeout=timeout_seconds) as ddgs:
-            return list(
-                ddgs.text(
-                    q,
-                    max_results=max(1, min(max_results, 10)),
-                    region="in-in",
-                    # Several engines so one rate-limited engine does not empty the
-                    # result; skip wikipedia/grokipedia ("auto" adds them) — useless
-                    # for live facts. (ddgs no longer ships a bing backend.)
-                    backend="duckduckgo,brave,mojeek,yahoo,startpage,google",
+    deadline = time.monotonic() + timeout_seconds
+    order = [_preferred_tier] + [i for i in range(len(_ENGINE_TIERS)) if i != _preferred_tier]
+    for tier in order:
+        left = deadline - time.monotonic()
+        if left < 0.5:
+            break
+        try:
+            with DDGS(timeout=min(left, 3.0)) as ddgs:
+                rows = list(
+                    ddgs.text(
+                        q,
+                        max_results=max(1, min(max_results, 10)),
+                        region="in-in",
+                        backend=_ENGINE_TIERS[tier],
+                    )
                 )
-            )
-    except Exception as exc:
-        log.warning("DuckDuckGo search failed for %r: %s", q[:60], exc)
-        return []
+        except Exception as exc:
+            log.debug("Search tier %s failed for %r: %s", _ENGINE_TIERS[tier], q[:60], exc)
+            continue
+        if rows:
+            if tier != _preferred_tier:
+                log.info("Web search now using %s", _ENGINE_TIERS[tier])
+                _preferred_tier = tier
+            return rows
+    log.warning("Web search found nothing for %r (all engines)", q[:60])
+    return []
 
 
 def _search_duckduckgo_sync(
@@ -644,10 +762,13 @@ def _search_duckduckgo_sync(
     queries = _topic_queries(query, topic) if topic != "general" else (build_search_query(query),)
     per_query = max(4, num_results + 2)
     all_rows: list[dict[str, Any]] = []
-    for q in queries[:3]:
-        all_rows.extend(
-            _ddg_text_sync(q, max_results=per_query, timeout_seconds=timeout_seconds)
-        )
+    # Topic searches (weather, gold, ...) send several queries; run them in parallel.
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        for rows in pool.map(
+            lambda q: _ddg_text_sync(q, max_results=per_query, timeout_seconds=timeout_seconds),
+            queries[:3],
+        ):
+            all_rows.extend(rows)
 
     raw_hits = _hits_from_ddg_rows(all_rows, limit=per_query * 3)
     hits = _rank_hits(raw_hits, topic=topic, limit=num_results)

@@ -14,6 +14,7 @@ I built it to test AI phone calls on a home LAN, and that's still the setting it
 - **Knows when you've stopped talking.** Asterisk's built-in silence detection kept recording for 10–40 seconds on a noisy line. Instead, the app taps the caller's audio over RTP and runs Silero VAD on it, so a turn ends about 0.7 s after you stop.
 - **Lets you interrupt.** If you talk over the bot, it stops mid-sentence and listens.
 - **Remembers the call.** The conversation history is kept until hang-up, so "what was my name again?" works.
+- **Answers from your own documents.** Put PDF, Word (.docx), TXT or Markdown files in `knowledge/`, and the bot answers from them when a question matches: prices, policies, opening hours, whatever you give it. Questions in Hindi still match English documents. See [Knowledge base](#knowledge-base) below.
 - **Looks things up.** If you ask for something it can't reliably know (opening hours, exchange rates, flight times…), it does a quick web search before answering. Small talk doesn't trigger a search.
 - **Gives cleaner audio.** TTS output is loudness-normalized, and there's a 16 kHz version for phones that use G.722.
 
@@ -72,6 +73,21 @@ Everything is set in `.env`; [.env.example](.env.example) lists every option wit
 
 Never commit `.env`.
 
+## Knowledge base
+
+Drop files into `knowledge/` (subfolders are fine): `.pdf`, `.docx`, `.txt`, `.md`. On startup the bot splits them into chunks and embeds them with `intfloat/multilingual-e5-small`; it downloads about 470 MB the first time. Only new or changed files are re-indexed, and the folder is re-checked every 30 seconds while the bot runs, so you don't need to restart after adding a file.
+
+On each turn, the caller's question is matched against the chunks. If something scores above `RAG_MIN_SCORE` (default 0.82), the top `RAG_TOP_K` chunks are given to the model and it answers from them, without a web search. Otherwise the call carries on as normal.
+
+To check what a question would pull up:
+
+```bash
+python -m ari_app.rag ingest                       # build / update the index
+python -m ari_app.rag search "what does the premium plan cost?"
+```
+
+Scanned PDFs (images with no text layer) won't work, because there's no OCR. Contents of `knowledge/` are git-ignored, so private documents don't get pushed.
+
 ## Known issues
 
 - **Free web search is unreliable.** DuckDuckGo and similar engines rate-limit by IP, so searches sometimes fail. When that happens, the bot says it couldn't find the answer and stops searching for a minute, but answers are only as good as the search snippets. For anything serious, use a SerpAPI or Google Programmable Search key.
@@ -88,7 +104,8 @@ The configs in `asterisk_snippets/` use example passwords (`1001`/`1001`). Chang
 ## Project layout
 
 ```
-ari_app/              the bot: ARI event loop, call session, STT, LLM, TTS, live VAD, web search
+ari_app/              the bot: ARI event loop, call session, STT, LLM, TTS, live VAD, web search, RAG
+knowledge/            your documents for the knowledge base (git-ignored)
 asterisk_snippets/    example Asterisk configs
 tts/                  TTS test scripts
 ```

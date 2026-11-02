@@ -1068,6 +1068,49 @@ class CallSession:
 
         return False, None
 
+    async def _knowledge_context(self, user_text: str) -> str | None:
+        """Reference text from the knowledge base (RAG) when the caller's question matches."""
+        if not self.settings.rag_enabled:
+            return None
+        from ari_app import rag
+        from ari_app.inference_pool import get_executor
+
+        kb = rag.get_knowledge_base(
+            self.settings.rag_docs_dir, model_name=self.settings.rag_embed_model
+        )
+        kb.maybe_refresh_in_background()
+        query = user_text
+        if len(user_text.split()) < 6:
+            # Short follow-ups ("and the price?") need the previous question.
+            prev = [m["content"] for m in self.ctx.history_for_llm() if m["role"] == "user"]
+            if prev:
+                query = f"{prev[-1]} {user_text}"
+        loop = asyncio.get_running_loop()
+        t0 = time.perf_counter()
+        try:
+            hits = await loop.run_in_executor(
+                get_executor(),
+                lambda: kb.search(
+                    query,
+                    top_k=self.settings.rag_top_k,
+                    min_score=self.settings.rag_min_score,
+                ),
+            )
+        except Exception as exc:
+            log.warning("[%s] knowledge base search failed: %s", self.ctx.session_id, exc)
+            return None
+        if not hits:
+            return None
+        log.info(
+            "[%s] knowledge base: %s chunks (best %.3f from %s) in %.0fms",
+            self.ctx.session_id,
+            len(hits),
+            hits[0].score,
+            hits[0].source,
+            (time.perf_counter() - t0) * 1000,
+        )
+        return rag.format_context(hits)
+
     def _reply_kwargs(
         self, *, user_text: str, reply_lang: str, grammar: str
     ) -> dict[str, Any]:
@@ -1090,8 +1133,13 @@ class CallSession:
             max_tokens=self.settings.llm_max_tokens,
         )
 
-    async def _model_requested_lookup(self, user_text: str) -> str | None:
-        """Search query when the model judges this turn needs facts it may not know."""
+    async def _model_requested_lookup(
+        self, user_text: str, *, force: bool = False
+    ) -> str | None:
+        """
+        Search query when the model judges this turn needs facts it may not know.
+        ``force``: the caller asked to search; only build the query from context.
+        """
         if not self.settings.web_search_enabled:
             return None
         try:
@@ -1101,6 +1149,7 @@ class CallSession:
                 model=self.settings.vllm_model,
                 user_text=user_text,
                 history=self.ctx.history_for_llm(),
+                force=force,
             )
         except Exception as exc:
             log.warning("[%s] web lookup check failed: %s", self.ctx.session_id, exc)
@@ -1118,7 +1167,7 @@ class CallSession:
             ctx_text, web_s = None, 0.0
         else:
             ctx_text, web_s, _ = await self._web_search(
-                query, use_cache_on_failure=False, budget_s=3.5
+                query, use_cache_on_failure=False, budget_s=5.0
             )
             if not ctx_text:
                 self._failed_queries[key] = time.monotonic()
@@ -1128,7 +1177,8 @@ class CallSession:
                 "work, so you do NOT have this information. In one short sentence, honestly "
                 "tell the caller you couldn't find that right now, then offer something else "
                 "you can help with. Do not say you will check, look into it, or get back to "
-                "them, and do not guess numbers, names or dates."
+                "them, do not say you have no internet access, and do not guess numbers, "
+                "names or dates."
             )
         return ctx_text, web_s
 
@@ -1182,6 +1232,15 @@ class CallSession:
                 else None
             )
             return cached, 0.0, cached is not None
+        # Same lookup moments ago ("are you sure?", "check again"): reuse it.
+        if (
+            self.ctx.last_web_query
+            and web_search.build_search_query(search_text) == self.ctx.last_web_query
+        ):
+            recent = self.ctx.get_fresh_web_context(ttl_seconds=120.0)
+            if recent:
+                log.info("[%s] reusing lookup from moments ago", self.ctx.session_id)
+                return recent, 0.0, True
         t0 = time.perf_counter()
         # Keep phone latency bounded: web fetch should not block for too long.
         web_timeout = max(2.0, min(self.settings.web_search_timeout_seconds, budget_s))
@@ -1239,12 +1298,29 @@ class CallSession:
             log.info("[%s] Web search found nothing in %.2fs", self.ctx.session_id, web_s)
             return None, web_s, False
         topic = web_search.detect_search_topic(search_text) or topic_hint or "general"
-        ctx_text = web_search.format_context_for_llm(hits, query=query, topic=topic)
+        passages: list[str] = []
+        remaining = web_timeout - web_s
+        if topic == "general" and remaining >= 0.8:
+            # Snippets are often teasers; read the top pages for the actual facts.
+            try:
+                passages = await asyncio.wait_for(
+                    web_search.read_top_pages(
+                        hits, search_text, timeout_seconds=min(1.5, remaining - 0.1)
+                    ),
+                    timeout=remaining,
+                )
+            except asyncio.TimeoutError:
+                passages = []
+            web_s = time.perf_counter() - t0
+        ctx_text = web_search.format_context_for_llm(
+            hits, query=query, topic=topic, passages=passages
+        )
         log.info(
-            "[%s] Web search done: topic=%s hits=%s ctx=%schars in %.2fs",
+            "[%s] Web search done: topic=%s hits=%s pages=%s ctx=%schars in %.2fs",
             self.ctx.session_id,
             topic,
             len(hits),
+            len(passages),
             len(ctx_text),
             web_s,
         )
@@ -1310,8 +1386,14 @@ class CallSession:
         if not needs_fresh:
             return None, 0.0, False
 
+        if refined_query is None:
+            # "search for me" / "check on the internet" name no topic; let the model
+            # build the query from the conversation instead of searching those words.
+            query = await self._model_requested_lookup(user_text, force=True)
+            if query:
+                search_text = query
         # Search silently: announcing every lookup gets repetitive on a call.
-        return await self._web_search(search_text, topic_hint=new_topic)
+        return await self._web_search(search_text, topic_hint=new_topic, budget_s=5.0)
 
     async def _reply_and_speak_streaming(
         self,
@@ -1770,9 +1852,15 @@ class CallSession:
                     )
                     grammar = self.ctx.resolved_grammar_gender()
 
-                    web_context, web_s, web_from_cache = await self._maybe_fetch_web_context(
-                        user_text, reply_lang
-                    )
+                    # Own documents first; web only when they have nothing relevant.
+                    web_context = await self._knowledge_context(user_text)
+                    web_s, web_from_cache = 0.0, False
+                    if web_context is None:
+                        (
+                            web_context,
+                            web_s,
+                            web_from_cache,
+                        ) = await self._maybe_fetch_web_context(user_text, reply_lang)
                     if web_from_cache:
                         log.info(
                             "[%s] turn=%s using cached web context (topic=%s)",

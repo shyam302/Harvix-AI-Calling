@@ -58,6 +58,11 @@ class Settings:
     vad_speech_threshold: float
     vad_no_speech_timeout_s: float  # stop listening if the caller says nothing
     barge_in_enabled: bool  # caller can interrupt the bot while it speaks
+    rag_enabled: bool  # answer from your own documents (RAG_DOCS_DIR) when they match
+    rag_docs_dir: str
+    rag_embed_model: str
+    rag_top_k: int
+    rag_min_score: float  # similarity needed to use a chunk (0.82 suits multilingual-e5)
     barge_in_threshold: float  # stricter than listening so line echo does not trigger
     barge_in_min_speech_ms: int  # sustained speech needed to cut the bot off
     prompt_on_silence: bool  # if false, stay on mic (no "say again?") on empty/silent turns
@@ -255,6 +260,14 @@ def load_settings() -> Settings:
         vad_no_speech_timeout_s=_float_env("VAD_NO_SPEECH_TIMEOUT_SECONDS", 8.0),
         barge_in_enabled=os.getenv("BARGE_IN_ENABLED", "true").strip().lower()
         not in ("0", "false", "no", "off"),
+        rag_enabled=os.getenv("RAG_ENABLED", "true").strip().lower()
+        not in ("0", "false", "no", "off"),
+        rag_docs_dir=(os.getenv("RAG_DOCS_DIR") or "knowledge").strip(),
+        rag_embed_model=(
+            os.getenv("RAG_EMBED_MODEL") or "intfloat/multilingual-e5-small"
+        ).strip(),
+        rag_top_k=_int_env("RAG_TOP_K", 3),
+        rag_min_score=_float_env("RAG_MIN_SCORE", 0.82),
         barge_in_threshold=_float_env("BARGE_IN_THRESHOLD", 0.7),
         barge_in_min_speech_ms=_int_env("BARGE_IN_MIN_SPEECH_MS", 400),
         prompt_on_silence=os.getenv("PROMPT_ON_SILENCE", "false").strip().lower()
@@ -281,7 +294,7 @@ def load_settings() -> Settings:
         tts_chunk_max_chars=_int_env("TTS_CHUNK_MAX_CHARS", 120),
         session_max_messages=_int_env("SESSION_MAX_MESSAGES", 24),
         call_primary_lang=_call_primary_lang_from_env(),
-        lang_switch_min_words=_int_env("LANG_SWITCH_MIN_WORDS", 2),
+        lang_switch_min_words=_int_env("LANG_SWITCH_MIN_WORDS", 3),
         lang_switch_min_prob=_float_env("LANG_SWITCH_MIN_PROB", 0.6),
         continuous_conversation=os.getenv(
             "CONTINUOUS_CONVERSATION", "false"
