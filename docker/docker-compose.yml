@@ -1,27 +1,28 @@
 # Asterisk in Docker for the call bot (image: andrius/asterisk).
 #
-#   cd docker && docker compose up -d
+#   cd docker && cp .env.example .env   # first time; edit values
+#   docker compose up -d
 #
-# Host networking: SIP (5060/udp), RTP (10000-10100/udp) and ARI (8088) appear
-# directly on this machine, and the bot's externalMedia RTP to 127.0.0.1 works.
-# Stop the system Asterisk first (sudo systemctl stop asterisk): both want 5060/8088.
+# Settings live in docker/.env. The files in asterisk/ are templates: ${VARS}
+# are filled from .env by render.sh each time the container starts.
+#
+# Host networking: SIP, RTP and ARI appear directly on this machine, and the
+# bot's externalMedia RTP to 127.0.0.1 works.
+# Stop the system Asterisk first (sudo systemctl stop asterisk): both want the same ports.
 services:
   asterisk:
-    image: andrius/asterisk:22.11.0_debian-trixie
+    image: ${ASTERISK_IMAGE:-andrius/asterisk:22.11.0_debian-trixie}
     container_name: callbot-asterisk
     network_mode: host
     restart: unless-stopped
+    env_file: .env
     environment:
-      PUID: "1000"               # match your user (id -u) so mounted dirs are writable
-      PGID: "1000"
       ASTERISK_TERMINAL_OPTS: "-n"   # no colour codes in docker logs
+    entrypoint: ["/render.sh"]
+    command: ["/usr/sbin/asterisk", "-vvvdddf", "-T", "-n", "-U", "asterisk", "-p"]
     volumes:
-      # Only the files we change; everything else keeps the image defaults.
-      - ./asterisk/pjsip.conf:/etc/asterisk/pjsip.conf:ro
-      - ./asterisk/extensions.conf:/etc/asterisk/extensions.conf:ro
-      - ./asterisk/http.conf:/etc/asterisk/http.conf:ro
-      - ./asterisk/ari.conf:/etc/asterisk/ari.conf:ro
-      - ./asterisk/rtp.conf:/etc/asterisk/rtp.conf:ro
-      # The bot writes TTS WAVs here (ASTERISK_SOUNDS_EN in .env) and Asterisk plays them.
+      - ./render.sh:/render.sh:ro
+      - ./asterisk:/templates:ro
+      # The bot writes TTS WAVs here (ASTERISK_SOUNDS_EN in project .env); Asterisk plays them.
       - ./data/sounds:/var/lib/asterisk/sounds/en
       - ./data/logs:/var/log/asterisk

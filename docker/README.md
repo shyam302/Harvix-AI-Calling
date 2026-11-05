@@ -5,12 +5,15 @@ This runs Asterisk 22.11 from [andrius/asterisk](https://hub.docker.com/r/andriu
 ```
 docker/
   docker-compose.yml
-  asterisk/          config files mounted into the container
-    pjsip.conf       phones 1001/1002 (password = user)
-    extensions.conf  7001 -> Stasis(callbot), 1001 <-> 1002
-    http.conf        ARI HTTP on 127.0.0.1:8088
-    ari.conf         ARI user callbot / 1001 (must match .env)
-    rtp.conf         RTP ports 10000-10100
+  .env               your settings (git-ignored); copy from .env.example
+  .env.example       all settings with defaults
+  render.sh          fills ${VARS} in asterisk/*.conf from .env at container start
+  asterisk/          config templates
+    pjsip.conf       phones 1001/1002, SIP port, Tailscale/NAT IP
+    extensions.conf  BOT_EXTENSION (7001) -> Stasis(callbot), 1001 <-> 1002
+    http.conf        ARI HTTP bind address and port
+    ari.conf         ARI user and password (must match the project .env)
+    rtp.conf         RTP port range
   data/              created at runtime, git-ignored
     sounds/          bot TTS WAVs (Asterisk plays from here)
     logs/            Asterisk logs
@@ -35,7 +38,16 @@ ASTERISK_SOUNDS_EN=/mnt/data/projects/Asterisk_Call/docker/data/sounds
 
 The bot writes TTS files to `<that>/custom/` and Asterisk, inside the container, sees them at `/var/lib/asterisk/sounds/en/custom/`.
 
-**3. Start Asterisk:**
+**3. Create the Docker settings file** (first time only) and check the values:
+
+```bash
+cd /mnt/data/projects/Asterisk_Call/docker
+cp .env.example .env
+```
+
+Phone passwords, ports, ARI login, Tailscale IP and the bot extension are all in `docker/.env`. After changing it, run `docker compose up -d` again (it recreates the container with the new values).
+
+**4. Start Asterisk:**
 
 ```bash
 cd /mnt/data/projects/Asterisk_Call/docker
@@ -43,7 +55,7 @@ docker compose up -d
 docker compose logs -f asterisk        # Ctrl+C to stop watching
 ```
 
-**4. Start the bot** as usual, in another terminal:
+**5. Start the bot** as usual, in another terminal:
 
 ```bash
 conda activate py311
@@ -51,22 +63,22 @@ cd /mnt/data/projects/Asterisk_Call
 python -m ari_app.server
 ```
 
-**5. Phone:** register Zoiper/Linphone as `1001` / `1001` (UDP) to this PC's IP, then dial `7001`.
+**6. Phone:** register Zoiper/Linphone as `1001` / `1001` (UDP) to this PC's IP, then dial `7001`.
 
 ## Everyday commands
 
 ```bash
 docker compose up -d                 # start
 docker compose down                  # stop
-docker compose restart asterisk      # after editing files in asterisk/
+docker compose up -d                 # after editing .env (recreates the container)
+docker compose restart asterisk      # after editing files in asterisk/ (re-renders them)
 docker exec -it callbot-asterisk asterisk -rvvv          # Asterisk console
 docker exec callbot-asterisk asterisk -rx "pjsip show endpoints"   # who is registered
-docker exec callbot-asterisk asterisk -rx "pjsip reload"           # reload SIP only
 ```
 
 ## Calling over Tailscale
 
-In `asterisk/pjsip.conf`, uncomment and set both lines under `[transport-udp]` to this PC's Tailscale IP (`tailscale ip -4`), then `docker compose restart asterisk`.
+Set `EXTERNAL_IP` in `docker/.env` to this PC's Tailscale IP (`tailscale ip -4`), then `docker compose up -d`.
 
 ## Going back to the system Asterisk
 
