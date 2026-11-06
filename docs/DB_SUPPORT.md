@@ -68,6 +68,7 @@ caller ─ Asterisk ─►│ call_session.py                        │
 - **`users`:** `id`, `phone` (unique caller id), `name`, `pin_hash`, `language`, `created_at`, `updated_at`, `last_call_at`. More fields can be added here later.
 - **`calls`:** `session_id`, `channel_id`, `user_id`, `caller_number`, `dialed_number`, `started_at`, `ended_at`, `duration_s`, `turns`, `language`, `status`, `recording_path`, `recording_bytes`. Status is one of `guest`, `registered`, `new_registration`, `verified`, `pin_failed`.
 - **`call_messages`:** `call_id`, `role` (`user` or `assistant`), `content`, `created_at`.
+- **`complaints`:** `ticket_no`, `call_id`, `user_id`, `caller_number`, `summary`, `details` (JSON answers to `complaint_questions.json`), `status`, `created_at`, `updated_at`.
 
 ## Run it
 
@@ -116,7 +117,7 @@ docker exec -it callbot-redis redis-cli -a callbot FT.INFO rag_idx   # num_docs 
 
 ## Not done yet
 
-- The complaint itself isn't saved as a structured record (only in `call_messages`). A `complaints` table with category, status and ticket number would be the next step.
+- Complaints are saved (`complaints` table, `complaint_questions.json`, ticket `100000 + id`), but there's no way to update a ticket's status, and the bot can't yet look a ticket up for the caller.
 - `db.recent_calls()` exists but isn't used yet. It could give the LLM "last time you called about…".
 - There's no way to reset a forgotten PIN.
 - The recordings page has no login. It's bound to 127.0.0.1, so add authentication before exposing it on a network.

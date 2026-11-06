@@ -124,6 +124,7 @@ Start them with `cd docker && docker compose up -d redis postgres`. The tables a
 | `users` | registered caller | `phone` (caller id, unique), `name`, `pin_hash`, `language`, `profile` (JSON answers), `last_call_at` |
 | `calls` | call | `caller_number`, `user_id`, `started_at`, `duration_s`, `turns`, `language`, `status`, `recording_path` |
 | `call_messages` | line said in a call | `call_id`, `role` (`user` or `assistant`), `content` |
+| `complaints` | complaint | `ticket_no`, `call_id`, `user_id`, `caller_number`, `summary` (what the caller first said), `details` (JSON answers), `status` (`open`) |
 
 `calls.status` is one of `guest`, `registered`, `new_registration`, `verified` or `pin_failed`.
 
@@ -138,7 +139,16 @@ Start them with `cd docker && docker compose up -d redis postgres`. The tables a
 
   Callers can say "skip". To add a field, edit the JSON and restart the bot; no database change is needed.
 - **PIN safety:** only a salted scrypt hash is stored. The PIN is never spoken back, logged, kept in chat history or sent to the LLM. Phone-number answers aren't logged either.
-- **PIN checks:** `AUTH_VERIFY_PIN=true` makes registered callers say their PIN before a complaint.
+- **PIN checks:** `AUTH_VERIFY_PIN=true` makes registered callers say their PIN before a complaint. If the PIN fails, no complaint is taken.
+
+### Complaints
+
+After registration (or straight away for a registered caller), the bot asks the questions in [complaint_questions.json](complaint_questions.json), saves them as one row in `complaints`, and reads out a ticket number digit by digit ("…your ticket number is 1 0 0 0 0 3"). Then the conversation carries on normally.
+
+- **Default questions:** `category` (a choice of order, delivery, payment, product quality, customer service or other), `order_number` (optional, spoken or typed) and `description` (type `free`: the caller's own words, kept as said).
+- **Format:** the same as the registration questions, plus the `free` type. Edit the file and restart the bot to change them.
+- **Guests too:** callers who skip registration can still lodge a complaint; it's saved against their caller number.
+- **Where to see them:** in the database, or on the call's page at `/recordings`, which shows the ticket and the answers.
 
 ### Call history and recordings
 
@@ -167,7 +177,7 @@ docker exec -it callbot-redis redis-cli -a callbot FT.INFO rag_idx    # num_docs
 - **G.722 (HD audio) can sound slow and garbled.** G.722 advertises an 8 kHz clock although the audio is 16 kHz, and some softphones get this wrong. The Docker setup therefore offers `CODECS=ulaw,alaw,g722`. To try HD audio, set `CODECS=g722,ulaw,alaw` in `docker/.env` and enable G.722 in the softphone, then switch back if playback sounds off.
 - **Small LLMs make things up.** The prompt pushes the model to search rather than guess, but a 2B model still gets things wrong now and then. Don't use this for anything where a wrong answer matters.
 - **Callers are identified by caller id.** Anyone calling from a registered number is treated as that person unless `AUTH_VERIFY_PIN=true`. There's no PIN reset yet.
-- **Complaints aren't tickets yet.** They're only in the call transcript; there's no `complaints` table with a status or ticket number.
+- **Complaints can't be followed up yet.** Tickets are created with status `open`, but there's no way to update them, and the bot can't yet answer "what's the status of ticket 100003?".
 - **Recordings are kept forever.** There's no retention or automatic clean-up.
 - **Only tested on a LAN.** Calling over the internet or Tailscale needs `external_media_address` set up in PJSIP (there are notes in the snippet), and you should lock down SIP and ARI first.
 - **Asterisk installed twice.** If you have both the distro Asterisk package and a source build, make sure the binary loads its own `libasteriskpj`. A mismatched PJSIP library crashed Asterisk on every SIP REGISTER here.
@@ -187,6 +197,7 @@ recordings/           compressed call recordings (git-ignored)
 asterisk_snippets/    example configs for a system Asterisk
 docs/                 call flow walkthrough (CALL_FLOW.md), database notes (DB_SUPPORT.md)
 registration_questions.json   extra questions asked when a caller registers
+complaint_questions.json      questions asked when a caller lodges a complaint
 tts/                  TTS test scripts
 ```
 

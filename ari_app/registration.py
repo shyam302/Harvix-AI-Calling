@@ -167,7 +167,7 @@ _SKIP = re.compile(
 @dataclass
 class Question:
     key: str
-    type: str  # text | digits | choice
+    type: str  # free | text | digits | choice
     ask: dict[str, str]
     required: bool = False
     min_len: int = 1
@@ -176,6 +176,13 @@ class Question:
 
     def prompt(self, lang: str) -> str:
         return self.ask.get(lang) or self.ask["en"]
+
+
+def load_complaint_questions() -> list[Question]:
+    """Questions from complaint_questions.json (COMPLAINT_QUESTIONS_FILE)."""
+    return load_questions(
+        Path(os.getenv("COMPLAINT_QUESTIONS_FILE") or _QUESTIONS_FILE.parent / "complaint_questions.json")
+    )
 
 
 def load_questions(path: Path | None = None) -> list[Question]:
@@ -195,8 +202,8 @@ def load_questions(path: Path | None = None) -> list[Question]:
         try:
             if not re.fullmatch(r"[a-z][a-z0-9_]{0,40}", q["key"]) or "en" not in q["ask"]:
                 raise ValueError("key must be lowercase_snake and ask.en is required")
-            if q.get("type", "text") not in ("text", "digits", "choice"):
-                raise ValueError("type must be text, digits or choice")
+            if q.get("type", "text") not in ("free", "text", "digits", "choice"):
+                raise ValueError("type must be free, text, digits or choice")
             out.append(
                 Question(
                     key=q["key"],
@@ -296,6 +303,10 @@ _LINES = {
         "pin_mismatch": "Those didn't match. Let's try again. Say a {n} digit PIN.",
         "registered": "Thank you, {name}, you're registered. Please remember your PIN.",
         "pin_saved": "Thank you, your PIN is saved. Just {k} quick questions more.",
+        "complaint_start": "Okay, let me take down your complaint.",
+        "complaint_saved": "Your complaint is registered. Your ticket number is {ticket}. Is there anything else I can help you with?",
+        "complaint_failed": "Sorry, I couldn't save the complaint right now. Please call again a little later.",
+        "complaint_no_pin": "Without verifying your PIN I can't take a complaint. Is there anything else I can help with?",
         "answer_again": "Sorry, I didn't catch that. Could you say it again?",
         "digits_again": "I need between {lo} and {hi} digits. Please say it again, or type it and press hash.",
         "reg_skipped": "No problem, we can finish the registration later.",
@@ -314,6 +325,10 @@ _LINES = {
         "pin_mismatch": "दोनों पिन मेल नहीं खाए। फिर से कोशिश करते हैं। {n} अंकों का पिन बोलिए।",
         "registered": "धन्यवाद, {name}, आपका रजिस्ट्रेशन हो गया। अपना पिन याद रखिए।",
         "pin_saved": "धन्यवाद, आपका पिन सेव हो गया। बस {k} छोटे सवाल और।",
+        "complaint_start": "ठीक है, मैं आपकी शिकायत दर्ज करती हूँ।",
+        "complaint_saved": "आपकी शिकायत दर्ज हो गई है। आपका टिकट नंबर है {ticket}। क्या मैं और कुछ मदद कर सकती हूँ?",
+        "complaint_failed": "माफ़ कीजिए, अभी शिकायत सेव नहीं हो पाई। कृपया थोड़ी देर बाद फिर कॉल करें।",
+        "complaint_no_pin": "पिन की पुष्टि के बिना मैं शिकायत नहीं ले सकती। क्या मैं और कुछ मदद कर सकती हूँ?",
         "answer_again": "माफ़ कीजिए, समझ नहीं पाई। क्या आप दोबारा बता सकते हैं?",
         "digits_again": "मुझे {lo} से {hi} अंक चाहिए। कृपया दोबारा बोलिए, या टाइप करके हैश दबाइए।",
         "reg_skipped": "कोई बात नहीं, रजिस्ट्रेशन बाद में कर लेंगे।",
@@ -329,3 +344,8 @@ _LINES = {
 def line(key: str, lang: str, **kw: object) -> str:
     table = _LINES.get(lang) or _LINES["en"]
     return table[key].format(**kw)
+
+
+def speak_ticket(ticket: str) -> str:
+    """'100012' -> '1 0 0 0 1 2' so TTS reads it digit by digit."""
+    return " ".join(ticket)

@@ -1914,6 +1914,13 @@ class CallSession:
             answer = await self._hear_once()
             if answer is None:
                 return None
+            if q.type == "free":
+                if answer and not (not q.required and registration.is_skip(answer) and len(answer.split()) <= 2):
+                    return answer  # the caller's own words
+                if answer:
+                    return ""
+                prompt = registration.line("answer_again", lang_code)
+                continue
             if answer and not q.required and registration.is_skip(answer) and len(answer.split()) <= 2:
                 return ""  # just "skip" / "no" / "nahi"
             if answer:
@@ -2060,30 +2067,95 @@ class CallSession:
             caller_name=self.caller_name,
         )
 
-    async def _complaint_gate(self, user_text: str) -> None:
+    async def _complaint_gate(self, user_text: str) -> bool:
         """
-        Caller wants to lodge a complaint: register them first if unknown (name + PIN),
-        or check their PIN if AUTH_VERIFY_PIN. Runs at most once per call; afterwards
-        the normal reply handles the complaint itself.
+        Caller wants to lodge a complaint (at most once per call):
+          1. unknown caller -> register (name, PIN, profile questions); may be skipped
+             registered + AUTH_VERIFY_PIN -> PIN check; failure = no complaint
+          2. ask complaint_questions.json, save to the complaints table
+          3. read out the ticket number
+        Returns True when the turn was handled here (no LLM reply needed).
         """
         if self._complaint_gate_done or not registration.wants_complaint(user_text):
-            return
-        if not db.available() or not self.caller_number:
-            return
+            return False
+        if not db.available():
+            return False
         self._complaint_gate_done = True
-        if self.ctx.user_id is None:
-            if not self.settings.registration_enabled:
-                return
+        lang_code = self._reg_lang()
+
+        if self.ctx.user_id is None and self.caller_number and self.settings.registration_enabled:
             log.info("[%s] complaint from unregistered caller: registering", self.ctx.session_id)
             closing = await self._register_new_caller()
-        elif self.settings.auth_verify_pin and self.ctx.user_status != "verified":
+            if self._closed:
+                return True
+            if closing:
+                await self.say_text(closing, record_in_session=False, trim=False)
+        elif self.ctx.user_id is not None and self.settings.auth_verify_pin and (
+            self.ctx.user_status != "verified"
+        ):
             user = await db.get_user_by_phone(self.caller_number)
-            closing = await self._verify_returning_caller(user) if user else ""
-            closing = closing or ""
-        else:
-            return
-        if closing and not self._closed:
+            closing = await self._verify_returning_caller(user) if user else None
+            if self._closed:
+                return True
+            if closing is None:
+                line = registration.line("complaint_no_pin", lang_code)
+                await self.say_text(line, record_in_session=False, trim=False)
+                self.ctx.add_user(user_text)
+                self.ctx.add_assistant(line)
+                return True
             await self.say_text(closing, record_in_session=False, trim=False)
+
+        await self._take_complaint(user_text)
+        return True
+
+    async def _take_complaint(self, user_text: str) -> None:
+        """Ask the complaint questions, save the complaint, read out the ticket number."""
+        lang_code = self._reg_lang()
+        questions = registration.load_complaint_questions()
+        details: dict[str, str] = {}
+        if questions:
+            await self.say_text(
+                registration.line("complaint_start", lang_code), record_in_session=False, trim=False
+            )
+        for q in questions:
+            value = await self._ask_question(q)
+            if value is None:
+                break  # hung up: still save what we have
+            if value:
+                details[q.key] = value
+                shown = value if q.type in ("choice", "text") else f"<{len(value)} chars>"
+                log.info("[%s] complaint: %s = %r", self.ctx.session_id, q.key, shown)
+            else:
+                log.info("[%s] complaint: %s skipped", self.ctx.session_id, q.key)
+
+        ticket = await db.create_complaint(
+            call_id=self.ctx.call_db_id,
+            user_id=self.ctx.user_id,
+            caller_number=self.caller_number,
+            summary=user_text,
+            details=details,
+        )
+        # Keep the conversation history meaningful for the LLM afterwards.
+        self.ctx.add_user(user_text)
+        if ticket is None:
+            line = registration.line("complaint_failed", lang_code)
+            log.warning("[%s] complaint could not be saved", self.ctx.session_id)
+        else:
+            line = registration.line(
+                "complaint_saved", lang_code, ticket=registration.speak_ticket(ticket)
+            )
+            log.info(
+                "[%s] complaint saved ticket=%s fields=%s",
+                self.ctx.session_id,
+                ticket,
+                sorted(details),
+            )
+        if not self._closed:
+            await self.say_text(line, record_in_session=False, trim=False)
+        summary = ", ".join(f"{k}: {v}" for k, v in details.items() if k != "description")
+        self.ctx.add_assistant(
+            f"(Complaint registered, ticket {ticket}. {summary})" if ticket else line
+        )
 
     async def run_loop(self) -> None:
         try:
@@ -2337,10 +2409,11 @@ class CallSession:
                     )
                     grammar = self.ctx.resolved_grammar_gender()
 
-                    # Complaint from an unregistered caller -> name + PIN first, then reply.
-                    await self._complaint_gate(user_text)
-                    if self._closed:
-                        break
+                    # Complaint -> (register / verify) -> complaint questions -> ticket.
+                    if await self._complaint_gate(user_text):
+                        if self._closed:
+                            break
+                        continue
 
                     # Own documents first; web only when they have nothing relevant.
                     web_context = await self._knowledge_context(user_text)

@@ -191,6 +191,7 @@ async def api_call(call_id: int) -> JSONResponse:
     if call is None:
         raise HTTPException(404, "No such call")
     call["messages"] = [_jsonable(m) for m in call["messages"]]
+    call["complaints"] = [_jsonable(c) for c in call.get("complaints", [])]
     call.pop("recording_path", None)  # the browser uses /audio, never a disk path
     return JSONResponse(_jsonable(call))
 

@@ -39,6 +39,19 @@ CREATE TABLE IF NOT EXISTS call_messages (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS complaints (
+    id            BIGSERIAL PRIMARY KEY,
+    ticket_no     TEXT UNIQUE,                    -- 100000 + id, read out to the caller
+    call_id       BIGINT REFERENCES calls(id) ON DELETE SET NULL,
+    user_id       BIGINT REFERENCES users(id) ON DELETE SET NULL,
+    caller_number TEXT,
+    summary       TEXT,                           -- what the caller said to start the complaint
+    details       JSONB NOT NULL DEFAULT '{}'::jsonb,  -- answers to complaint_questions.json
+    status        TEXT NOT NULL DEFAULT 'open',
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 CREATE INDEX IF NOT EXISTS calls_user_idx ON calls(user_id, started_at DESC);
 CREATE INDEX IF NOT EXISTS calls_caller_idx ON calls(caller_number, started_at DESC);
 CREATE INDEX IF NOT EXISTS call_messages_call_idx ON call_messages(call_id, id);

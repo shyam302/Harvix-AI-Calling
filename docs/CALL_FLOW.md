@@ -256,27 +256,38 @@ Runs two jobs **in parallel**:
 
 ---
 
-## Stage 5b: Complaint? Register first
+## Stage 5b: Complaint? Register first, then take it
 
-### `_complaint_gate(user_text)` (~line 1970)
+### `_complaint_gate(user_text)`
 It runs on every turn, right after STT, and does something **at most once per call**:
 
 ```python
 if not registration.wants_complaint(user_text):   # "complaint", "lodge", "शिकायत", …
-    return
-if ctx.user_id is None:                 # unknown caller → register
-    closing = await self._register_new_caller()
-elif AUTH_VERIFY_PIN:                   # known caller → check PIN (optional)
-    closing = await self._verify_returning_caller(user)
-await self.say_text(closing)            # "Thank you, Shyam, you're registered."
+    return False                                   # normal turn
+if ctx.user_id is None:                 # unknown caller → register (can be skipped)
+    await self._register_new_caller()   # name, PIN, registration_questions.json
+elif AUTH_VERIFY_PIN:                   # known caller → check PIN; fail = no complaint
+    await self._verify_returning_caller(user)
+await self._take_complaint(user_text)   # complaint_questions.json → complaints table
+return True                             # turn handled: no LLM reply this time
 ```
-After this, the turn continues normally: the LLM answers the complaint (Stage 7), now knowing the caller's name.
+
+### `_take_complaint(user_text)`
+- Asks each question in `complaint_questions.json` through `_ask_question()`:
+  - `choice`: the LLM maps "it's about delivery" to `delivery`.
+  - `digits`: spoken, or typed with `#`.
+  - `free`: the caller's own words.
+  - `text`: a short value the LLM extracts.
+- Saves everything with `db.create_complaint()`. The ticket is `100000 + id`.
+- Reads it out digit by digit: "Your complaint is registered. Your ticket number is 1 0 0 0 0 3."
+- Adds a short note to chat history, "(Complaint registered, ticket 100003, category: delivery…)", so the LLM knows about it for the rest of the call.
 
 ### `_register_new_caller()` (~line 1866)
 1. **Name:** `_ask("…What's your name?")` → `_hear_once()` → `registration.extract_name()`. This is a small JSON call to the LLM ("Yeah hi, this is Shyam here" → "Shyam"), with simple patterns as a fallback. Up to 3 tries.
 2. **PIN:** `_ask_pin()`, then `_ask_pin("say it once more to confirm")`. If the two don't match, it asks again.
 3. **Save:** `db.create_user(phone, name, pin)` stores a **scrypt hash** (`db.hash_pin`), and `db.set_call_user(call_id, user_id, "new_registration")` links the call.
-4. If the caller gives up, `"No problem, we can finish the registration later."` and the call continues as a guest.
+4. **Profile:** `_ask_profile_questions()` asks `registration_questions.json` (city, alternate phone…) and saves each answer at once with `db.update_user_profile()` into `users.profile` (JSON).
+5. If the caller gives up, `"No problem, we can finish the registration later."` and the call continues as a guest.
 
 Registration prompts are spoken with `record_in_session=False` and `trim=False`: they're never added to chat history and are never shortened. The answers (name and PIN) are never added to history either.
 

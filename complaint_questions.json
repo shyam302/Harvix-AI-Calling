@@ -1,0 +1,44 @@
+{
+  "_help": [
+    "Questions asked when a caller lodges a complaint (after registration / PIN check).",
+    "Answers are saved in the complaints table, column details (JSON), under 'key'.",
+    "Edit freely; restart the bot to apply. Same format as registration_questions.json.",
+    "type: 'free'   -> the caller's own words, kept as said (use for descriptions)",
+    "type: 'text'   -> a short answer the LLM extracts (a name, a city, a product)",
+    "type: 'digits' -> spoken or typed on the keypad (# to finish); min_len / max_len",
+    "type: 'choice' -> one of 'options' (the LLM maps the reply to one of them)",
+    "required: false lets the caller say 'skip'."
+  ],
+  "questions": [
+    {
+      "key": "category",
+      "type": "choice",
+      "options": ["order", "delivery", "payment", "product quality", "customer service", "other"],
+      "required": true,
+      "ask": {
+        "en": "What is the complaint about? For example an order, delivery, payment, product quality, or customer service.",
+        "hi": "शिकायत किस बारे में है? जैसे ऑर्डर, डिलीवरी, पेमेंट, प्रोडक्ट की क्वालिटी, या कस्टमर सर्विस।"
+      }
+    },
+    {
+      "key": "order_number",
+      "type": "digits",
+      "min_len": 4,
+      "max_len": 12,
+      "required": false,
+      "ask": {
+        "en": "If you have an order number, say it or type it and press hash. Otherwise say skip.",
+        "hi": "अगर आपके पास ऑर्डर नंबर है, तो बोलिए या टाइप करके हैश दबाइए। नहीं तो स्किप बोलिए।"
+      }
+    },
+    {
+      "key": "description",
+      "type": "free",
+      "required": true,
+      "ask": {
+        "en": "Please describe the problem in a few sentences.",
+        "hi": "कृपया कुछ वाक्यों में समस्या बताइए।"
+      }
+    }
+  ]
+}

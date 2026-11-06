@@ -58,6 +58,20 @@ CREATE INDEX IF NOT EXISTS calls_user_idx ON calls(user_id, started_at DESC);
 CREATE INDEX IF NOT EXISTS calls_caller_idx ON calls(caller_number, started_at DESC);
 CREATE INDEX IF NOT EXISTS call_messages_call_idx ON call_messages(call_id, id);
 ALTER TABLE users ADD COLUMN IF NOT EXISTS profile JSONB NOT NULL DEFAULT '{}'::jsonb;
+CREATE TABLE IF NOT EXISTS complaints (
+    id            BIGSERIAL PRIMARY KEY,
+    ticket_no     TEXT UNIQUE,
+    call_id       BIGINT REFERENCES calls(id) ON DELETE SET NULL,
+    user_id       BIGINT REFERENCES users(id) ON DELETE SET NULL,
+    caller_number TEXT,
+    summary       TEXT,
+    details       JSONB NOT NULL DEFAULT '{}'::jsonb,
+    status        TEXT NOT NULL DEFAULT 'open',
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS complaints_user_idx ON complaints(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS complaints_call_idx ON complaints(call_id);
 ALTER TABLE calls ADD COLUMN IF NOT EXISTS recording_path TEXT;
 ALTER TABLE calls ADD COLUMN IF NOT EXISTS recording_bytes BIGINT;
 """
@@ -373,6 +387,12 @@ async def get_call(call_id: int) -> dict | None:
         )
         out = dict(row)
         out["messages"] = [dict(m) for m in msgs]
+        comps = await con.fetch(
+            "SELECT ticket_no, status, summary, details::text AS details, created_at "
+            "FROM complaints WHERE call_id = $1 ORDER BY id",
+            call_id,
+        )
+        out["complaints"] = [dict(c) for c in comps]
         return out
 
     return await _run("get_call", q)
@@ -390,3 +410,50 @@ async def update_user_profile(user_id: int, fields: dict[str, str]) -> None:
         )
 
     await _run("update_user_profile", q)
+
+
+# complaints
+
+async def create_complaint(
+    *,
+    call_id: int | None,
+    user_id: int | None,
+    caller_number: str | None,
+    summary: str,
+    details: dict[str, str],
+) -> str | None:
+    """Save a complaint; returns its ticket number (100000 + id), or None on failure."""
+    import json
+
+    async def q(con):
+        async with con.transaction():
+            cid = await con.fetchval(
+                """
+                INSERT INTO complaints (call_id, user_id, caller_number, summary, details)
+                VALUES ($1, $2, $3, $4, $5::jsonb) RETURNING id
+                """,
+                call_id,
+                user_id,
+                caller_number,
+                summary,
+                json.dumps(details, ensure_ascii=False),
+            )
+            ticket = str(100000 + cid)
+            await con.execute("UPDATE complaints SET ticket_no = $2 WHERE id = $1", cid, ticket)
+            return ticket
+
+    return await _run("create_complaint", q)
+
+
+async def complaints_for_call(call_id: int) -> list[dict]:
+    async def q(con):
+        rows = await con.fetch(
+            """
+            SELECT ticket_no, status, summary, details::text AS details, created_at
+              FROM complaints WHERE call_id = $1 ORDER BY id
+            """,
+            call_id,
+        )
+        return [dict(r) for r in rows]
+
+    return await _run("complaints_for_call", q, default=[])
