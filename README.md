@@ -106,27 +106,69 @@ With `RAG_STORE=redis`, the chunks and their vectors live in Redis (a RediSearch
 
 Scanned PDFs (images with no text layer) won't work, because there's no OCR. Contents of `knowledge/` are git-ignored, so private documents don't get pushed.
 
-## Callers, call history and recordings
+## Database support
 
-Everything here needs PostgreSQL (`DATABASE_URL`). Without it, calls still work.
+Two databases run in Docker next to Asterisk. Both are optional: if one is down, the bot logs it once and carries on.
 
-- **Returning callers:** the caller id (for example `1001`) is looked up in `users`. If it's found, the bot greets them by name.
-- **Registration:** this only happens when an unregistered caller wants to lodge a complaint ("complaint", "lodge", "शिकायत"…). The bot asks for their name, then a PIN twice. The caller can say the PIN or type it: four digits finish the entry, `#` ends it early, `*` clears. Set `AUTH_VERIFY_PIN=true` to make registered callers confirm their PIN before a complaint.
-- **History:** each call gets a row in `calls` (time, duration, turns, language, outcome), and every line said goes to `call_messages`.
-- **Recordings:** saved as `recordings/YYYY/MM/DD/<time>_<caller>_<session>.ogg` (git-ignored).
+| Database | What it holds | Setting | Without it |
+|---|---|---|---|
+| **Redis Stack** | Knowledge-base chunks and their vectors (a RediSearch HNSW index) | `RAG_STORE=redis`, `REDIS_URL` | The local index in `knowledge/.rag_index/` |
+| **PostgreSQL** | Registered callers, every call, every line said | `DATABASE_URL` | Every caller is a guest; no history or recordings list |
 
-To browse them, open **http://127.0.0.1:8765/recordings** while the bot is running. You can search by number, name or anything that was said, then play the call (with a speed control), download it, and read the transcript. The page has no login and only listens on localhost, so keep it that way or add authentication.
+Start them with `cd docker && docker compose up -d redis postgres`. The tables are created automatically when the bot starts.
 
-[docs/DB_SUPPORT.md](docs/DB_SUPPORT.md) has the tables, the SQL to inspect them, and what's not done yet.
+### Tables
+
+| Table | One row per | Main columns |
+|---|---|---|
+| `users` | registered caller | `phone` (caller id, unique), `name`, `pin_hash`, `language`, `profile` (JSON answers), `last_call_at` |
+| `calls` | call | `caller_number`, `user_id`, `started_at`, `duration_s`, `turns`, `language`, `status`, `recording_path` |
+| `call_messages` | line said in a call | `call_id`, `role` (`user` or `assistant`), `content` |
+
+`calls.status` is one of `guest`, `registered`, `new_registration`, `verified` or `pin_failed`.
+
+### Callers and registration
+
+- **Returning callers:** the caller id (for example `1001`) is looked up in `users` when the call starts. If it's found, the bot greets them by name and keeps using the name. Nobody is asked anything up front.
+- **Registration happens only when it's needed:** when an unregistered caller wants to lodge a complaint ("complaint", "lodge", "शिकायत"…). The bot asks for their name, then a PIN twice. The caller can say the PIN or type it: four digits finish the entry, `#` ends it early, `*` clears. Then the bot goes back to the complaint.
+- **Extra questions:** after the PIN, the bot asks the questions in [registration_questions.json](registration_questions.json) (by default city and an alternate phone number) and saves each answer to `users.profile` as soon as it's given. A question can be:
+  - `text`: the LLM pulls the answer out of the reply,
+  - `digits`: spoken, or typed with `#` at the end,
+  - `choice`: one of a list of `options`.
+
+  Callers can say "skip". To add a field, edit the JSON and restart the bot; no database change is needed.
+- **PIN safety:** only a salted scrypt hash is stored. The PIN is never spoken back, logged, kept in chat history or sent to the LLM. Phone-number answers aren't logged either.
+- **PIN checks:** `AUTH_VERIFY_PIN=true` makes registered callers say their PIN before a complaint.
+
+### Call history and recordings
+
+- Every call gets a row in `calls`, and every line said goes to `call_messages`.
+- Both voices are recorded and compressed to Opus (16 kbps mono, about 60 KB per minute, around 16 times smaller than the WAV), saved as `recordings/YYYY/MM/DD/<HHMMSS>_<caller>_<session>.ogg`. Change the folder with `RECORDINGS_DIR`, or turn recording off with `CALL_RECORDING_ENABLED=false`. The folder is git-ignored.
+- To browse them, open **http://127.0.0.1:8765/recordings** while the bot is running. You can search by number, name or anything that was said, then play the call (with a speed control), download it, and read the transcript and the caller's profile. The page has no login and only listens on localhost, so keep it that way or add authentication.
+
+### Looking at the data
+
+```bash
+docker exec -it callbot-postgres psql -U callbot
+  SELECT id, phone, name, profile, last_call_at FROM users;
+  SELECT id, caller_number, status, turns, round(duration_s) AS secs, started_at
+    FROM calls ORDER BY id DESC LIMIT 10;
+  SELECT role, content FROM call_messages WHERE call_id = 12 ORDER BY id;
+
+docker exec -it callbot-redis redis-cli -a callbot FT.INFO rag_idx    # num_docs = chunks
+```
+
+[docs/DB_SUPPORT.md](docs/DB_SUPPORT.md) has the design, test results and what's not done yet.
 
 ## Known issues
 
 - **Free web search is unreliable.** DuckDuckGo and similar engines rate-limit by IP, so searches sometimes fail. When that happens, the bot says it couldn't find the answer and stops searching for a minute, but answers are only as good as the search snippets. For anything serious, use a SerpAPI or Google Programmable Search key.
 - **Barge-in relies on the phone's echo cancellation.** If the bot's own voice leaks back through your mic, it can interrupt itself. Raise `BARGE_IN_THRESHOLD` or `BARGE_IN_MIN_SPEECH_MS`, or turn barge-in off.
-- **HD audio needs G.722 negotiated.** Put `g722` first in the endpoint's `allow=` line and enable G.722 in the softphone; otherwise calls stay at narrowband (8 kHz) quality.
+- **G.722 (HD audio) can sound slow and garbled.** G.722 advertises an 8 kHz clock although the audio is 16 kHz, and some softphones get this wrong. The Docker setup therefore offers `CODECS=ulaw,alaw,g722`. To try HD audio, set `CODECS=g722,ulaw,alaw` in `docker/.env` and enable G.722 in the softphone, then switch back if playback sounds off.
 - **Small LLMs make things up.** The prompt pushes the model to search rather than guess, but a 2B model still gets things wrong now and then. Don't use this for anything where a wrong answer matters.
 - **Callers are identified by caller id.** Anyone calling from a registered number is treated as that person unless `AUTH_VERIFY_PIN=true`. There's no PIN reset yet.
-- **Complaints aren't stored as tickets.** They're only in the call transcript for now.
+- **Complaints aren't tickets yet.** They're only in the call transcript; there's no `complaints` table with a status or ticket number.
+- **Recordings are kept forever.** There's no retention or automatic clean-up.
 - **Only tested on a LAN.** Calling over the internet or Tailscale needs `external_media_address` set up in PJSIP (there are notes in the snippet), and you should lock down SIP and ARI first.
 - **Asterisk installed twice.** If you have both the distro Asterisk package and a source build, make sure the binary loads its own `libasteriskpj`. A mismatched PJSIP library crashed Asterisk on every SIP REGISTER here.
 
@@ -143,7 +185,8 @@ docker/               Asterisk + Redis + PostgreSQL in Docker
 knowledge/            your documents for the knowledge base (git-ignored)
 recordings/           compressed call recordings (git-ignored)
 asterisk_snippets/    example configs for a system Asterisk
-docs/                 call flow walkthrough, database notes, WebRTC plan
+docs/                 call flow walkthrough (CALL_FLOW.md), database notes (DB_SUPPORT.md)
+registration_questions.json   extra questions asked when a caller registers
 tts/                  TTS test scripts
 ```
 
