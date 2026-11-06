@@ -10,3 +10,6 @@ logs/
 *.wav
 knowledge/*
 !knowledge/.gitkeep
+
+# Private planning notes (not pushed)
+docs/WEBRTC_PLAN.md
