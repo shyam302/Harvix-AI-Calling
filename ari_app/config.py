@@ -63,6 +63,13 @@ class Settings:
     rag_embed_model: str
     rag_top_k: int
     rag_min_score: float  # similarity needed to use a chunk (0.82 suits multilingual-e5)
+    database_url: str  # PostgreSQL for users + call history; empty = off
+    registration_enabled: bool  # ask unknown callers for name + PIN
+    auth_verify_pin: bool  # registered callers must say their PIN first
+    pin_length: int
+    call_recording_enabled: bool  # record whole calls (both voices) to RECORDINGS_DIR
+    recordings_dir: str
+    recording_opus_kbps: int  # Opus bitrate for stored recordings (16 = ~60 KB/min)
     barge_in_threshold: float  # stricter than listening so line echo does not trigger
     barge_in_min_speech_ms: int  # sustained speech needed to cut the bot off
     prompt_on_silence: bool  # if false, stay on mic (no "say again?") on empty/silent turns
@@ -268,6 +275,16 @@ def load_settings() -> Settings:
         ).strip(),
         rag_top_k=_int_env("RAG_TOP_K", 3),
         rag_min_score=_float_env("RAG_MIN_SCORE", 0.82),
+        database_url=(os.getenv("DATABASE_URL") or "").strip(),
+        registration_enabled=os.getenv("REGISTRATION_ENABLED", "true").strip().lower()
+        not in ("0", "false", "no", "off"),
+        auth_verify_pin=os.getenv("AUTH_VERIFY_PIN", "false").strip().lower()
+        in ("1", "true", "yes", "on"),
+        pin_length=max(3, min(8, _int_env("PIN_LENGTH", 4))),
+        call_recording_enabled=os.getenv("CALL_RECORDING_ENABLED", "true").strip().lower()
+        not in ("0", "false", "no", "off"),
+        recordings_dir=(os.getenv("RECORDINGS_DIR") or "recordings").strip(),
+        recording_opus_kbps=max(8, min(64, _int_env("RECORDING_OPUS_KBPS", 16))),
         barge_in_threshold=_float_env("BARGE_IN_THRESHOLD", 0.7),
         barge_in_min_speech_ms=_int_env("BARGE_IN_MIN_SPEECH_MS", 400),
         prompt_on_silence=os.getenv("PROMPT_ON_SILENCE", "false").strip().lower()

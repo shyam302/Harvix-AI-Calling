@@ -31,7 +31,7 @@ log = logging.getLogger(__name__)
 
 # Helper channels the session creates in its own Stasis app; ari_loop must not
 # treat their StasisStart as a new call.
-INTERNAL_CHANNEL_PREFIXES = ("cbsnoop-", "cbmedia-")
+INTERNAL_CHANNEL_PREFIXES = ("cbsnoop-", "cbmedia-", "cbrec-")
 
 SAMPLE_RATE = 16000
 _WINDOW = 512  # Silero window at 16 kHz (32 ms)

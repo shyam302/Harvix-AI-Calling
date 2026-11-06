@@ -10,3 +10,4 @@ logs/
 *.wav
 knowledge/*
 !knowledge/.gitkeep
+recordings/

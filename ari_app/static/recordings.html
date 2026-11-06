@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Call Recordings</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #fff; --text: #1d2330; --muted: #6b7280;
+    --line: #e5e7eb; --accent: #0f766e; --accent-soft: #e6f4f2; --warn: #b45309;
+    --user: #eef2ff; --bot: #f3f4f6;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #111418; --card: #1a1f26; --text: #e6e8eb; --muted: #9aa3ad; --line: #2a313b;
+      --accent: #2dd4bf; --accent-soft: #12302d; --warn: #f59e0b; --user: #1e2440; --bot: #232a33;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 15px/1.5 system-ui, sans-serif; background: var(--bg); color: var(--text); }
+  header { padding: 20px 20px 0; max-width: 1200px; margin: 0 auto; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 13px; margin: 0 0 16px; }
+  .wrap { max-width: 1200px; margin: 0 auto; padding: 0 20px 40px; display: grid;
+          grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr); gap: 16px; }
+  @media (max-width: 860px) { .wrap { grid-template-columns: 1fr; } }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+  .toolbar { display: flex; gap: 8px; padding: 10px; border-bottom: 1px solid var(--line); }
+  input[type=search] { flex: 1; min-width: 0; padding: 8px 10px; border: 1px solid var(--line);
+    border-radius: 8px; background: var(--bg); color: var(--text); font: inherit; }
+  button { border: 1px solid var(--line); background: transparent; color: var(--text);
+    border-radius: 8px; padding: 7px 12px; font: inherit; font-size: 14px; cursor: pointer; }
+  button:hover { background: var(--bg); }
+  #list { max-height: calc(100vh - 170px); overflow-y: auto; }
+  .row { display: grid; grid-template-columns: 1fr auto; gap: 2px 12px; padding: 10px 14px;
+         border-bottom: 1px solid var(--line); cursor: pointer; }
+  .row:hover { background: var(--bg); }
+  .row.sel { background: var(--accent-soft); }
+  .who { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .when, .meta { color: var(--muted); font-size: 13px; }
+  .meta { text-align: right; font-variant-numeric: tabular-nums; }
+  .tag { display: inline-block; font-size: 11px; padding: 1px 7px; border-radius: 999px;
+         background: var(--bg); color: var(--muted); margin-left: 6px; font-weight: 500; }
+  .tag.reg { background: var(--accent-soft); color: var(--accent); }
+  .tag.norec { color: var(--warn); }
+  #empty, #more { padding: 18px; text-align: center; color: var(--muted); }
+  #detail { padding: 16px; }
+  #detail h2 { font-size: 17px; margin: 0 0 2px; }
+  .facts { color: var(--muted); font-size: 13px; margin-bottom: 12px; }
+  audio { width: 100%; margin: 6px 0 4px; }
+  .actions { display: flex; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; }
+  .actions a { color: var(--accent); font-size: 14px; }
+  .msgs { display: flex; flex-direction: column; gap: 8px; max-height: calc(100vh - 360px); overflow-y: auto; }
+  .msg { padding: 8px 11px; border-radius: 10px; max-width: 92%; }
+  .msg.user { background: var(--user); align-self: flex-end; }
+  .msg.assistant { background: var(--bot); align-self: flex-start; }
+  .msg small { display: block; color: var(--muted); font-size: 11px; }
+  .error { color: var(--warn); padding: 14px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Call recordings</h1>
+  <p class="sub">Every call with its recording (Opus, compressed) and transcript. Search by number, name or anything said.</p>
+</header>
+<div class="wrap">
+  <div class="card">
+    <div class="toolbar">
+      <input id="q" type="search" placeholder="Search number, name or words…">
+      <button id="refresh" title="Reload">Refresh</button>
+    </div>
+    <div id="list"><div id="empty">Loading…</div></div>
+  </div>
+  <div class="card" id="detail"><p class="sub">Select a call to play it.</p></div>
+</div>
+
+<script>
+const PAGE = 50;
+let offset = 0, selected = null, timer = null;
+const listEl = document.getElementById("list");
+const detailEl = document.getElementById("detail");
+const qEl = document.getElementById("q");
+
+const fmtDur = s => s == null ? "–" : `${Math.floor(s / 60)}:${String(Math.round(s % 60)).padStart(2, "0")}`;
+const fmtSize = b => b == null ? "" : b > 1048576 ? (b / 1048576).toFixed(1) + " MB" : Math.round(b / 1024) + " KB";
+const fmtWhen = iso => new Date(iso).toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
+const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
+
+async function load(reset = true) {
+  if (reset) { offset = 0; listEl.innerHTML = ""; }
+  document.getElementById("more")?.remove();
+  let rows;
+  try {
+    const r = await fetch(`/api/calls?limit=${PAGE}&offset=${offset}&q=${encodeURIComponent(qEl.value)}`);
+    if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
+    rows = await r.json();
+  } catch (e) {
+    listEl.innerHTML = ""; listEl.append(el("div", "error", "Could not load calls: " + e.message)); return;
+  }
+  if (reset && !rows.length) { listEl.append(el("div", null, "No calls found.")).id = "empty"; return; }
+  for (const c of rows) {
+    const row = el("div", "row" + (c.id === selected ? " sel" : ""));
+    row.dataset.id = c.id;
+    const who = el("div", "who", c.user_name || c.caller_number || "Unknown caller");
+    if (c.user_name && c.caller_number) who.append(el("span", "tag", c.caller_number));
+    if (c.status && c.status !== "guest") who.append(el("span", "tag reg", c.status.replace("_", " ")));
+    if (!c.has_recording) who.append(el("span", "tag norec", "no audio"));
+    row.append(who, el("div", "meta", fmtDur(c.duration_s)),
+               el("div", "when", fmtWhen(c.started_at)), el("div", "meta", fmtSize(c.recording_bytes)));
+    row.onclick = () => show(c.id);
+    listEl.append(row);
+  }
+  offset += rows.length;
+  if (rows.length === PAGE) {
+    const more = el("div", null); more.id = "more";
+    const b = el("button", null, "Load more"); b.onclick = () => load(false);
+    more.append(b); listEl.append(more);
+  }
+}
+
+async function show(id) {
+  selected = id;
+  document.querySelectorAll(".row").forEach(r => r.classList.toggle("sel", +r.dataset.id === id));
+  detailEl.innerHTML = "";
+  let c;
+  try {
+    const r = await fetch(`/api/calls/${id}`);
+    if (!r.ok) throw new Error(r.statusText);
+    c = await r.json();
+  } catch (e) { detailEl.append(el("div", "error", "Could not load call: " + e.message)); return; }
+
+  detailEl.append(el("h2", null, c.user_name || c.caller_number || "Unknown caller"));
+  const facts = [fmtWhen(c.started_at), "duration " + fmtDur(c.duration_s),
+                 (c.turns ?? 0) + " turns", c.language && "lang " + c.language, c.status,
+                 c.caller_number && "from " + c.caller_number].filter(Boolean).join(" · ");
+  detailEl.append(el("div", "facts", facts));
+  let profile = {};
+  try { profile = JSON.parse(c.user_profile || "{}"); } catch {}
+  const keys = Object.keys(profile);
+  if (keys.length) {
+    const box = el("div", "facts");
+    box.textContent = "Profile: " + keys.map(k => `${k.replace(/_/g, " ")}: ${profile[k]}`).join(" · ");
+    detailEl.append(box);
+  }
+
+  if (c.recording_bytes) {
+    const audio = el("audio"); audio.controls = true; audio.preload = "metadata";
+    audio.src = `/api/calls/${id}/audio`;
+    detailEl.append(audio);
+    const actions = el("div", "actions");
+    const a = el("a", null, `Download (.ogg, ${fmtSize(c.recording_bytes)})`);
+    a.href = `/api/calls/${id}/audio?download=true`;
+    const speed = el("button", null, "Speed 1×");
+    speed.onclick = () => { audio.playbackRate = audio.playbackRate >= 2 ? 1 : audio.playbackRate + 0.5;
+                            speed.textContent = `Speed ${audio.playbackRate}×`; };
+    actions.append(a, speed); detailEl.append(actions);
+  } else {
+    detailEl.append(el("p", "sub", "No recording stored for this call."));
+  }
+
+  const msgs = el("div", "msgs");
+  if (!c.messages.length) msgs.append(el("p", "sub", "No transcript."));
+  for (const m of c.messages) {
+    const b = el("div", "msg " + m.role);
+    b.append(el("small", null, (m.role === "user" ? "Caller" : "Bot") + " · " +
+      new Date(m.created_at).toLocaleTimeString([], { timeStyle: "medium" })));
+    b.append(document.createTextNode(m.content));
+    msgs.append(b);
+  }
+  detailEl.append(msgs);
+}
+
+qEl.oninput = () => { clearTimeout(timer); timer = setTimeout(() => load(true), 300); };
+document.getElementById("refresh").onclick = () => load(true);
+load(true);
+</script>
+</body>
+</html>

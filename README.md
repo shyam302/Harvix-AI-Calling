@@ -16,13 +16,17 @@ I built it to test AI phone calls on a home LAN, and that's still the setting it
 - **Remembers the call.** The conversation history is kept until hang-up, so "what was my name again?" works.
 - **Answers from your own documents.** Put PDF, Word (.docx), TXT or Markdown files in `knowledge/`, and the bot answers from them when a question matches: prices, policies, opening hours, whatever you give it. Questions in Hindi still match English documents. See [Knowledge base](#knowledge-base) below.
 - **Looks things up.** If you ask for something it can't reliably know (opening hours, exchange rates, flight times…), it does a quick web search before answering. Small talk doesn't trigger a search.
+- **Knows returning callers.** Callers are looked up by caller id in PostgreSQL. A registered caller is greeted by name ("Welcome back, Shyam!"), and the bot uses the name during the call. Nobody is asked anything up front.
+- **Registers callers only when needed.** When an unregistered caller wants to lodge a complaint, the bot asks for their name and a 4-digit PIN (spoken, or typed on the keypad), confirms it, saves them, and then takes the complaint. Only a salted hash of the PIN is stored, and it's never logged or sent to the LLM.
+- **Records and logs every call.** Both voices are recorded and compressed to Opus (about 60 KB per minute), and every line said is saved. A small web page lets you search calls, play them and read the transcript.
 - **Gives cleaner audio.** TTS output is loudness-normalized, and there's a 16 kHz version for phones that use G.722.
 
 There's also a `/health` endpoint, and an optional log file (`LOG_FILE`) that records per-turn timing: speech-to-text, LLM, web search, TTS and playback.
 
 ## Requirements
 
-- Linux with Asterisk 22 (PJSIP + ARI). I run 22.9 built from source.
+- Linux with Asterisk 22 (PJSIP + ARI): either the Docker setup in `docker/` (easiest) or your own install. I've run 22.9 from source and 22.11 in Docker.
+- Docker, for Redis (document search) and PostgreSQL (callers and call history). Both are optional: without them the bot uses a local index and treats every caller as a guest.
 - Python 3.11 and `ffmpeg`.
 - An NVIDIA GPU is strongly recommended. On an RTX 3070 laptop GPU, Whisper `medium` takes about 0.5 s per turn and Supertonic about 0.2 s.
 - An LLM server with an OpenAI-style `/v1` API: vLLM, Ollama, llama.cpp server, etc. Small models are fine; this was tuned on `google/gemma-4-E2B-it`.
@@ -42,7 +46,15 @@ pip install -r requirements.txt
 cp .env.example .env     # then edit: ARI_PASSWORD, VLLM_BASE_URL, VLLM_MODEL
 ```
 
-1. Copy the files in `asterisk_snippets/` into `/etc/asterisk/` and include them from `pjsip.conf` and `extensions.conf`. Change the example passwords first.
+1. Start Asterisk, Redis and PostgreSQL in Docker:
+
+   ```bash
+   cd docker && cp .env.example .env    # edit passwords; they must match the project .env
+   docker compose up -d                 # asterisk + redis + postgres
+   cd ..
+   ```
+
+   See [docker/README.md](docker/README.md). If you'd rather use a system Asterisk, copy `asterisk_snippets/` into `/etc/asterisk/` instead, include them from `pjsip.conf` and `extensions.conf`, and change the example passwords first. With the Docker Asterisk, set `ASTERISK_SOUNDS_EN=<project>/docker/data/sounds` in `.env` so Asterisk can find the bot's audio.
 2. Make sure your LLM server answers: `curl $VLLM_BASE_URL/models`.
 3. Start the bot:
 
@@ -70,6 +82,10 @@ Everything is set in `.env`; [.env.example](.env.example) lists every option wit
 | `VAD_END_SILENCE_MS` | How long a pause ends your turn (default 700). Raise it if the bot cuts you off |
 | `BARGE_IN_ENABLED` | Set to `false` if the bot keeps interrupting itself (see below) |
 | `WEB_SEARCH_PROVIDER` | `fast` (free, DuckDuckGo), `serpapi` or `google` (need API keys) |
+| `RAG_STORE` / `REDIS_URL` | `redis` keeps the document index in Redis; `local` keeps it in files |
+| `DATABASE_URL` | PostgreSQL for callers and call history; leave it empty to turn both off |
+| `REGISTRATION_ENABLED` / `AUTH_VERIFY_PIN` / `PIN_LENGTH` | Registration before a complaint; whether registered callers must say their PIN first |
+| `CALL_RECORDING_ENABLED` / `RECORDINGS_DIR` / `RECORDING_OPUS_KBPS` | Whole-call recordings and where they go |
 
 Never commit `.env`.
 
@@ -86,7 +102,22 @@ python -m ari_app.rag ingest                       # build / update the index
 python -m ari_app.rag search "what does the premium plan cost?"
 ```
 
+With `RAG_STORE=redis`, the chunks and their vectors live in Redis (a RediSearch HNSW index), which keeps lookups at a few milliseconds as the collection grows. If Redis can't be reached, the bot falls back to the local index in `knowledge/.rag_index/`.
+
 Scanned PDFs (images with no text layer) won't work, because there's no OCR. Contents of `knowledge/` are git-ignored, so private documents don't get pushed.
+
+## Callers, call history and recordings
+
+Everything here needs PostgreSQL (`DATABASE_URL`). Without it, calls still work.
+
+- **Returning callers:** the caller id (for example `1001`) is looked up in `users`. If it's found, the bot greets them by name.
+- **Registration:** this only happens when an unregistered caller wants to lodge a complaint ("complaint", "lodge", "शिकायत"…). The bot asks for their name, then a PIN twice. The caller can say the PIN or type it: four digits finish the entry, `#` ends it early, `*` clears. Set `AUTH_VERIFY_PIN=true` to make registered callers confirm their PIN before a complaint.
+- **History:** each call gets a row in `calls` (time, duration, turns, language, outcome), and every line said goes to `call_messages`.
+- **Recordings:** saved as `recordings/YYYY/MM/DD/<time>_<caller>_<session>.ogg` (git-ignored).
+
+To browse them, open **http://127.0.0.1:8765/recordings** while the bot is running. You can search by number, name or anything that was said, then play the call (with a speed control), download it, and read the transcript. The page has no login and only listens on localhost, so keep it that way or add authentication.
+
+[docs/DB_SUPPORT.md](docs/DB_SUPPORT.md) has the tables, the SQL to inspect them, and what's not done yet.
 
 ## Known issues
 
@@ -94,23 +125,29 @@ Scanned PDFs (images with no text layer) won't work, because there's no OCR. Con
 - **Barge-in relies on the phone's echo cancellation.** If the bot's own voice leaks back through your mic, it can interrupt itself. Raise `BARGE_IN_THRESHOLD` or `BARGE_IN_MIN_SPEECH_MS`, or turn barge-in off.
 - **HD audio needs G.722 negotiated.** Put `g722` first in the endpoint's `allow=` line and enable G.722 in the softphone; otherwise calls stay at narrowband (8 kHz) quality.
 - **Small LLMs make things up.** The prompt pushes the model to search rather than guess, but a 2B model still gets things wrong now and then. Don't use this for anything where a wrong answer matters.
+- **Callers are identified by caller id.** Anyone calling from a registered number is treated as that person unless `AUTH_VERIFY_PIN=true`. There's no PIN reset yet.
+- **Complaints aren't stored as tickets.** They're only in the call transcript for now.
 - **Only tested on a LAN.** Calling over the internet or Tailscale needs `external_media_address` set up in PJSIP (there are notes in the snippet), and you should lock down SIP and ARI first.
 - **Asterisk installed twice.** If you have both the distro Asterisk package and a source build, make sure the binary loads its own `libasteriskpj`. A mismatched PJSIP library crashed Asterisk on every SIP REGISTER here.
 
 ## Security
 
-The configs in `asterisk_snippets/` use example passwords (`1001`/`1001`). Change them before the box is reachable from anywhere you don't trust. Keep ARI bound to `127.0.0.1`. Only open SIP (5060/udp) and RTP (10000–20000/udp) to the networks that need them.
+The configs in `asterisk_snippets/` and `docker/.env.example` use example passwords (`1001`/`1001`, `callbot` for Redis and PostgreSQL). Change them before the box is reachable from anywhere you don't trust. Keep ARI, Redis, PostgreSQL and the bot's web server (recordings page) bound to `127.0.0.1`. The Docker setup does this. Only open SIP (5060/udp) and RTP (10000–20000/udp) to the networks that need them.
 
 ## Project layout
 
 ```
-ari_app/              the bot: ARI event loop, call session, STT, LLM, TTS, live VAD, web search, RAG
+ari_app/              the bot: ARI event loop, call session, STT, LLM, TTS, live VAD, web search, RAG,
+                      database (db.py), registration, call recording, recordings page (static/)
+docker/               Asterisk + Redis + PostgreSQL in Docker
 knowledge/            your documents for the knowledge base (git-ignored)
-asterisk_snippets/    example Asterisk configs
+recordings/           compressed call recordings (git-ignored)
+asterisk_snippets/    example configs for a system Asterisk
+docs/                 call flow walkthrough, database notes, WebRTC plan
 tts/                  TTS test scripts
 ```
 
-[ARCHITECTURE.md](ARCHITECTURE.md) explains how a call flows through the modules.
+[docs/CALL_FLOW.md](docs/CALL_FLOW.md) walks through one call from dialing to hang-up, naming the function that does each step. [ARCHITECTURE.md](ARCHITECTURE.md) is the older overview.
 
 ## License
 

@@ -10,8 +10,8 @@ import sys
 from collections.abc import AsyncIterator
 from pathlib import Path
 
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 from ari_app.ari_loop import get_active_call_registry, run_ari_forever
 from ari_app.config import load_settings
@@ -123,10 +123,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     task = asyncio.create_task(run_ari_forever(), name="ari_forever")
     yield
+    # Shutdown (Ctrl+C): every step is time-boxed so one Ctrl+C is enough.
+    log.info("Shutting down: stopping ARI loop and closing the database")
     task.cancel()
-    with contextlib.suppress(asyncio.CancelledError):
-        await task
+    with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+        await asyncio.wait_for(task, timeout=3)
     shutdown_inference_pool()
+    from ari_app import db
+
+    await db.close()
 
 
 app = FastAPI(title="Asterisk Callbot", lifespan=lifespan)
@@ -148,7 +153,63 @@ async def health() -> JSONResponse:
 @app.get("/")
 async def root() -> JSONResponse:
     return JSONResponse(
-        {"service": "asterisk-callbot", "health": "/health"},
+        {"service": "asterisk-callbot", "health": "/health", "recordings": "/recordings"},
+    )
+
+
+# ---- call recordings page + API (data from PostgreSQL, audio from RECORDINGS_DIR) ----
+
+_STATIC = Path(__file__).resolve().parent / "static"
+
+
+def _jsonable(row: dict) -> dict:
+    return {k: (v.isoformat() if hasattr(v, "isoformat") else v) for k, v in row.items()}
+
+
+@app.get("/recordings", response_class=HTMLResponse)
+async def recordings_page() -> HTMLResponse:
+    return HTMLResponse((_STATIC / "recordings.html").read_text(encoding="utf-8"))
+
+
+@app.get("/api/calls")
+async def api_calls(
+    q: str = "", limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0)
+) -> JSONResponse:
+    from ari_app import db
+
+    if not db.available():
+        raise HTTPException(503, "Database not connected (DATABASE_URL / docker compose up -d postgres)")
+    rows = await db.list_calls(limit=limit, offset=offset, search=q)
+    return JSONResponse([_jsonable(r) for r in rows])
+
+
+@app.get("/api/calls/{call_id}")
+async def api_call(call_id: int) -> JSONResponse:
+    from ari_app import db
+
+    call = await db.get_call(call_id)
+    if call is None:
+        raise HTTPException(404, "No such call")
+    call["messages"] = [_jsonable(m) for m in call["messages"]]
+    call.pop("recording_path", None)  # the browser uses /audio, never a disk path
+    return JSONResponse(_jsonable(call))
+
+
+@app.get("/api/calls/{call_id}/audio")
+async def api_call_audio(call_id: int, download: bool = False) -> FileResponse:
+    from ari_app import call_recording, db
+
+    call = await db.get_call(call_id)
+    if call is None or not call.get("recording_path"):
+        raise HTTPException(404, "No recording for this call")
+    root = call_recording.recordings_root(load_settings().recordings_dir)
+    path = call_recording.resolve_inside(root, call["recording_path"])
+    if path is None:
+        raise HTTPException(404, "Recording file missing on disk")
+    return FileResponse(
+        path,
+        media_type="audio/ogg",
+        filename=path.name if download else None,
     )
 
 
@@ -162,6 +223,9 @@ def main() -> None:
         host=host,
         port=port,
         log_level=os.getenv("UVICORN_LOG_LEVEL", "info"),
+        # Don't wait forever for browsers (recordings page keeps audio connections
+        # open); after 3 s open connections are closed and shutdown continues.
+        timeout_graceful_shutdown=3,
     )
 
 

@@ -145,7 +145,14 @@ def build_system_prompt(
         system = _PHONE_AGENT_CORE_EN + _PERSONA_OTHER[g] + _reply_language_rule(reply_lang)
 
     if caller_name and caller_name not in ("-", "unknown"):
-        system += f" The caller's name may be {caller_name}."
+        if caller_context and "registered" in caller_context:
+            # Name comes from our user database, so it is reliable.
+            system += (
+                f" The caller is {caller_name}, a registered customer. Use their name "
+                "naturally now and then (not in every reply)."
+            )
+        else:
+            system += f" The caller's name may be {caller_name}."
     if caller_context:
         system += f" Caller info (do not read out): {caller_context}."
     elif caller_number:

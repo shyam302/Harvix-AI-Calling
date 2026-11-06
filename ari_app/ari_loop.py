@@ -54,6 +54,10 @@ async def run_ari_forever() -> None:
         log.error("Set ARI_PASSWORD in the environment or .env file.")
         sys.exit(1)
 
+    from ari_app import db
+
+    await db.init(settings.database_url)  # users + call history; calls still work without it
+
     ari_base = f"http://{settings.ari_host}:{settings.ari_port}/ari"
     auth = httpx.BasicAuth(settings.ari_username, settings.ari_password)
     api_key = quote(f"{settings.ari_username}:{settings.ari_password}", safe="")
@@ -152,6 +156,13 @@ async def run_ari_forever() -> None:
             cid = channel_id_from_target_uri(pb.get("target_uri") or "")
             if cid and cid in sessions:
                 sessions[cid].on_playback_finished(pb)
+            return
+
+        if et == "ChannelDtmfReceived":
+            # Keypad press (PIN can be typed instead of spoken)
+            cid = (ev.get("channel") or {}).get("id")
+            if cid and cid in sessions:
+                sessions[cid].on_dtmf(ev.get("digit") or "")
             return
 
         if et == "ChannelDestroyed":

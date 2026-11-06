@@ -1,0 +1,32 @@
+{
+  "_help": [
+    "Extra questions asked during registration, after the name and PIN are saved.",
+    "Answers go to users.profile (JSON) under 'key'. Edit freely; restart the bot to apply.",
+    "type: 'text'   -> the LLM extracts the answer from what the caller said",
+    "type: 'digits' -> spoken or typed on the keypad (# to finish); min_len / max_len digits",
+    "type: 'choice' -> one of 'options' (the LLM maps the reply to one of them)",
+    "required: false lets the caller say 'skip'. 'ask' needs 'en'; 'hi' is optional."
+  ],
+  "questions": [
+    {
+      "key": "city",
+      "type": "text",
+      "required": false,
+      "ask": {
+        "en": "Which city are you calling from?",
+        "hi": "आप किस शहर से बात कर रहे हैं?"
+      }
+    },
+    {
+      "key": "alternate_phone",
+      "type": "digits",
+      "min_len": 10,
+      "max_len": 12,
+      "required": false,
+      "ask": {
+        "en": "Do you have another phone number we can reach you on? Say it, or type it and press hash. You can also say skip.",
+        "hi": "क्या आपका कोई दूसरा फ़ोन नंबर है? बोलिए, या टाइप करके हैश दबाइए। आप स्किप भी बोल सकते हैं।"
+      }
+    }
+  ]
+}

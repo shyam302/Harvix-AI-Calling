@@ -29,6 +29,7 @@ from ari_app import (
     voice_select,
     web_search,
 )
+from ari_app import call_recording, db, registration
 from ari_app.call_context import CallContext
 from ari_app.config import Settings
 
@@ -207,6 +208,10 @@ def stasis_channel_peer_info(ch: dict[str, Any]) -> tuple[str | None, str | None
     return caller_number, caller_name, dialed
 
 
+# Whisper hint while a PIN is expected: write digits, not words.
+_PIN_STT_PROMPT = "PIN digits: 4 7 0 9. 2 5 8 1."
+
+
 class CallSession:
     def __init__(
         self,
@@ -266,6 +271,14 @@ class CallSession:
         self._vad: live_vad.LiveVad | None = None
         self._vad_channels: list[str] = []
         self._vad_bridge: str | None = None
+        self._db_tasks: set[asyncio.Task[None]] = set()
+        self._complaint_gate_done = False
+        self._rec_channel: str | None = None  # snoop (spy=both) recorded for the whole call
+        self._rec_name: str | None = None
+        self._rec_started_at = None
+        self._dtmf_digits: list[str] = []  # keypad presses since the last PIN prompt
+        self._dtmf_event = asyncio.Event()
+        self.ctx.message_listener = self._log_message_to_db
 
     def _is_likely_line_noise_clip(
         self,
@@ -1477,12 +1490,18 @@ class CallSession:
         *,
         record_in_session: bool = True,
         is_opening: bool = False,
+        trim: bool = True,
     ) -> str:
         full_text = (text or "").strip()
-        spoken = conversation.trim_reply_for_phone(
-            full_text,
-            max_sentences=self.settings.reply_max_sentences,
-            max_chars=self.settings.reply_max_chars,
+        # trim=False for fixed system prompts (registration), which must be said in full
+        spoken = (
+            conversation.trim_reply_for_phone(
+                full_text,
+                max_sentences=self.settings.reply_max_sentences,
+                max_chars=self.settings.reply_max_chars,
+            )
+            if trim
+            else full_text
         )
         if spoken != full_text:
             log.info(
@@ -1598,6 +1617,474 @@ class CallSession:
 
         return spoken
 
+    # ---- database: call history + caller identity -------------------------------
+
+    def on_dtmf(self, digit: str) -> None:
+        """ARI ChannelDtmfReceived: collect keypad digits ('#' ends, '*' clears)."""
+        if not digit:
+            return
+        if digit == "#" and not any(d.isdigit() for d in self._dtmf_digits):
+            return  # stray "#" (e.g. the end key of the previous entry)
+        if digit == "*":
+            self._dtmf_digits.clear()
+        else:
+            self._dtmf_digits.append(digit)
+        # Never log the digit itself (it is part of a PIN).
+        log.info("[%s] keypad key received (%s buffered)", self.ctx.session_id, len(self._dtmf_digits))
+        self._dtmf_event.set()
+
+    async def _wait_dtmf_number(self, lo: int, hi: int, *, idle_s: float = 8.0) -> str | None:
+        """Keypad number of lo..hi digits, finished by '#' or reaching hi. None = not typed."""
+        while True:
+            typed = "".join(d for d in self._dtmf_digits if d.isdigit())
+            if len(typed) >= hi or ("#" in self._dtmf_digits and typed):
+                return typed[:hi]
+            self._dtmf_event.clear()
+            try:
+                await asyncio.wait_for(self._dtmf_event.wait(), timeout=idle_s)
+            except asyncio.TimeoutError:
+                return typed if lo <= len(typed) <= hi else None
+
+    async def _wait_dtmf_pin(self, n: int, *, idle_s: float = 6.0) -> str | None:
+        """Wait for n keypad digits (or '#'). None when the caller stops typing."""
+        while True:
+            typed = "".join(d for d in self._dtmf_digits if d.isdigit())
+            if len(typed) >= n or ("#" in self._dtmf_digits and typed):
+                return typed[:n] if len(typed) >= n else typed
+            self._dtmf_event.clear()
+            try:
+                await asyncio.wait_for(self._dtmf_event.wait(), timeout=idle_s)
+            except asyncio.TimeoutError:
+                return None
+
+    # ---- whole-call recording -----------------------------------------------------
+
+    async def _start_call_recording(self) -> None:
+        """Record caller + bot (snoop spy=both) for the whole call. Failures are logged only."""
+        if not self.settings.call_recording_enabled:
+            return
+        from datetime import datetime
+
+        snoop_id = f"cbrec-{uuid.uuid4().hex[:12]}"
+        name = f"call-{self.ctx.session_id}"
+        try:
+            await self._post(
+                f"{self._channel_path()}/snoop",
+                params={"spy": "both", "app": self.settings.stasis_app, "snoopId": snoop_id},
+            )
+            self._rec_channel = snoop_id
+            await self._post(
+                f"/channels/{snoop_id}/record",
+                params={
+                    "name": name,
+                    "format": "wav",
+                    "ifExists": "overwrite",
+                    "maxDurationSeconds": 0,
+                    "maxSilenceSeconds": 0,
+                    "beep": "false",
+                    "terminateOn": "none",
+                },
+            )
+            self._rec_name = name
+            self._rec_started_at = datetime.now()
+            log.info("[%s] call recording started", self.ctx.session_id)
+        except Exception as exc:
+            log.warning("[%s] call recording could not start: %s", self.ctx.session_id, exc)
+            if self._rec_channel:
+                await self._delete(f"/channels/{self._rec_channel}")
+                self._rec_channel = None
+
+    async def _finish_call_recording(self) -> None:
+        """Stop, fetch, compress to Opus, store, and link it to the call row."""
+        name, started = self._rec_name, self._rec_started_at
+        self._rec_name = None
+        if not name:
+            return
+        try:
+            await self.client.post(
+                f"{self.ari_base}/recordings/live/{name}/stop", auth=self.auth
+            )
+        except httpx.HTTPError:
+            pass  # already stopped when the channel went away
+        if self._rec_channel:
+            await self._delete(f"/channels/{self._rec_channel}")
+            self._rec_channel = None
+        wav = call_recording.temp_wav()
+        try:
+            ok = False
+            for _ in range(5):  # the file is finalised a moment after the stop
+                ok = await stt.download_recording_file(
+                    url=f"{self.ari_base}/recordings/stored/{name}/file",
+                    dest=wav,
+                    auth=self.auth,
+                    client=self.client,
+                )
+                if ok:
+                    break
+                await asyncio.sleep(0.5)
+            if not ok:
+                log.warning("[%s] call recording file not found in Asterisk", self.ctx.session_id)
+                return
+            root = call_recording.recordings_root(self.settings.recordings_dir)
+            dst = call_recording.target_path(
+                root, started=started, caller=self.caller_number, session_id=self.ctx.session_id
+            )
+            wav_size = wav.stat().st_size
+            size = await call_recording.compress_to_opus(
+                wav, dst, kbps=self.settings.recording_opus_kbps
+            )
+            rel = str(dst.relative_to(root))
+            await db.set_call_recording(self.ctx.call_db_id, rel, size)
+            log.info(
+                "[%s] call recording saved %s (%.0f KB, wav was %.0f KB)",
+                self.ctx.session_id,
+                rel,
+                size / 1024,
+                wav_size / 1024,
+            )
+            await self._delete(f"/recordings/stored/{name}")
+        except Exception as exc:
+            log.warning("[%s] saving call recording failed: %s", self.ctx.session_id, exc)
+        finally:
+            wav.unlink(missing_ok=True)
+
+    def _log_message_to_db(self, role: str, text: str) -> None:
+        """CallContext hook: store each history line without delaying the call."""
+        if self.ctx.call_db_id is None:
+            return
+        t = asyncio.create_task(db.add_message(self.ctx.call_db_id, role, text))
+        self._db_tasks.add(t)
+        t.add_done_callback(self._db_tasks.discard)
+
+    async def _db_call_started(self) -> None:
+        self.ctx.call_db_id = await db.start_call(
+            session_id=self.ctx.session_id,
+            channel_id=self.channel_id,
+            caller_number=self.caller_number,
+            dialed_number=self.dialed_number,
+        )
+
+    async def _db_call_ended(self) -> None:
+        if self._db_tasks:
+            await asyncio.gather(*self._db_tasks, return_exceptions=True)
+        await db.end_call(
+            self.ctx.call_db_id,
+            duration_s=time.time() - self.ctx.started_at,
+            turns=self.ctx.turn_count,
+            language=self.ctx.preferred_lang,
+            status=self.ctx.user_status,
+        )
+
+    async def _hear_once(self, *, stt_prompt: str | None = None) -> str | None:
+        """
+        One short caller answer as text (for registration questions).
+        Returns "" when nothing usable was said, None when the call is gone.
+        The text is NOT added to chat history (it may be a PIN).
+        """
+        await self._prepare_to_listen()
+        if self._closed:
+            return None
+        wav_path: Path | None = None
+        try:
+            turn = await self._capture_turn_vad() if self._vad is not None else None
+            if self._closed:
+                return None
+            if turn is not None:
+                wav_path = turn[0]
+                if wav_path is None:
+                    return ""
+            else:
+                rec_name = await self.start_recording()
+                if rec_name is None:
+                    return None
+                info = await self.wait_recording()
+                self._clear_recording_wait()
+                name = info.get("name") or ""
+                if info.get("state") == "failed" or not name:
+                    return ""
+                wav_path = await self.fetch_recording_wav(name)
+                await self.delete_stored_recording(name)
+                if wav_path is None:
+                    return ""
+            if stt_prompt:
+                text, *_ = await stt.transcribe_wav(
+                    wav_path, self.settings.whisper_model, initial_prompt=stt_prompt
+                )
+            else:
+                text, *_ = await self._transcribe_turn(wav_path)
+            return (text or "").strip()
+        finally:
+            if wav_path:
+                wav_path.unlink(missing_ok=True)
+
+    async def _ask(self, prompt: str) -> str | None:
+        """Say a prompt (kept out of history) and return the caller's answer."""
+        await self.say_text(prompt, record_in_session=False, trim=False)
+        if self._closed:
+            return None
+        return await self._hear_once()
+
+    def _reg_lang(self) -> str:
+        return "hi" if self.ctx.preferred_lang == "hi" else "en"
+
+    async def _ask_pin(self, first_prompt: str, attempts: int = 3) -> str | None:
+        """
+        Ask until exactly PIN_LENGTH digits arrive, spoken OR typed on the keypad
+        (whichever comes first). None = gave up / hung up.
+        """
+        n = self.settings.pin_length
+        prompt = first_prompt
+        for _ in range(attempts):
+            self._dtmf_digits.clear()  # keys pressed during the prompt still count
+            await self.say_text(prompt, record_in_session=False, trim=False)
+            if self._closed:
+                return None
+            voice = asyncio.create_task(self._hear_once(stt_prompt=_PIN_STT_PROMPT))
+            keys = asyncio.create_task(self._wait_dtmf_pin(n))
+            done, _ = await asyncio.wait({voice, keys}, return_when=asyncio.FIRST_COMPLETED)
+            pin: str | None = None
+            if keys in done and keys.result() and len(keys.result()) == n:
+                pin = keys.result()
+                await self._cancel_listen(voice)
+                log.info("[%s] PIN entered on keypad", self.ctx.session_id)
+            else:
+                answer = await voice
+                if answer is None:
+                    keys.cancel()
+                    return None
+                pin = registration.parse_pin(answer, n)
+                if pin is None and self._dtmf_digits:
+                    # Started typing while the mic timed out: let them finish.
+                    typed = await keys
+                    pin = typed if typed and len(typed) == n else None
+                else:
+                    keys.cancel()
+            if pin:
+                return pin
+            log.info("[%s] PIN not understood, asking again", self.ctx.session_id)
+            prompt = registration.line("pin_again", self._reg_lang(), n=n)
+        return None
+
+    async def _cancel_listen(self, task: asyncio.Task) -> None:
+        """Stop a _hear_once() that is still waiting for speech (keypad won)."""
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        if self._vad is not None:
+            if self.settings.barge_in_enabled:
+                self._vad.arm("barge")
+            else:
+                self._vad.disarm()
+
+    async def _ask_question(self, q: registration.Question) -> str | None:
+        """
+        One extra registration question. Returns the answer, "" when skipped / not
+        understood, or None when the call is gone.
+        """
+        lang_code = self._reg_lang()
+        prompt = q.prompt(lang_code)
+        for attempt in range(2):
+            self._dtmf_digits.clear()
+            await self.say_text(prompt, record_in_session=False, trim=False)
+            if self._closed:
+                return None
+            if q.type == "digits":
+                voice = asyncio.create_task(self._hear_once(stt_prompt=_PIN_STT_PROMPT))
+                keys = asyncio.create_task(self._wait_dtmf_number(q.min_len, q.max_len))
+                done, _ = await asyncio.wait({voice, keys}, return_when=asyncio.FIRST_COMPLETED)
+                if keys in done and keys.result():
+                    await self._cancel_listen(voice)
+                    answer, value = "", keys.result()
+                else:
+                    answer = await voice
+                    if answer is None:
+                        keys.cancel()
+                        return None
+                    value = registration.parse_digits(answer)
+                    if not value and self._dtmf_digits:
+                        value = await keys or ""
+                    else:
+                        keys.cancel()
+                if q.min_len <= len(value) <= q.max_len:
+                    return value
+                if not q.required and registration.is_skip(answer):
+                    return ""
+                prompt = registration.line("digits_again", lang_code, lo=q.min_len, hi=q.max_len)
+                continue
+
+            answer = await self._hear_once()
+            if answer is None:
+                return None
+            if answer and not q.required and registration.is_skip(answer) and len(answer.split()) <= 2:
+                return ""  # just "skip" / "no" / "nahi"
+            if answer:
+                value = await registration.extract_answer(
+                    q,
+                    answer,
+                    base_url=self.settings.vllm_base_url,
+                    api_key=self.settings.vllm_api_key,
+                    model=self.settings.vllm_model,
+                )
+                if value:
+                    return value
+                if not q.required and registration.is_skip(answer):
+                    return ""  # no answer in it and they said skip / no
+            prompt = registration.line("answer_again", lang_code)
+        return ""
+
+    async def _ask_profile_questions(self, user_id: int) -> None:
+        """Ask registration_questions.json and save each answer to users.profile."""
+        questions = registration.load_questions()
+        if not questions:
+            return
+        await self.say_text(
+            registration.line("pin_saved", self._reg_lang(), k=len(questions)),
+            record_in_session=False,
+            trim=False,
+        )
+        for q in questions:
+            value = await self._ask_question(q)
+            if value is None:
+                return  # hung up; earlier answers are already saved
+            if value:
+                await db.update_user_profile(user_id, {q.key: value})
+                # never log digit answers (phone numbers); text answers are fine
+                shown = value if q.type != "digits" else f"<{len(value)} digits>"
+                log.info("[%s] registration: %s = %r", self.ctx.session_id, q.key, shown)
+            else:
+                log.info("[%s] registration: %s skipped", self.ctx.session_id, q.key)
+
+    async def _register_new_caller(self) -> str:
+        """Ask name + PIN, save the user. Returns the line that opens the conversation."""
+        lang_code = self._reg_lang()
+        n = self.settings.pin_length
+        name: str | None = None
+        prompt = registration.line("ask_name", lang_code)
+        for _ in range(3):
+            answer = await self._ask(prompt)
+            if answer is None:
+                return ""
+            if answer:
+                name = await registration.extract_name(
+                    answer,
+                    base_url=self.settings.vllm_base_url,
+                    api_key=self.settings.vllm_api_key,
+                    model=self.settings.vllm_model,
+                )
+            if name:
+                break
+            prompt = registration.line("name_again", lang_code)
+        if not name:
+            log.info("[%s] registration: no name heard; continuing as guest", self.ctx.session_id)
+            return registration.line("reg_skipped", lang_code)
+        self.ctx.caller_name = name
+        log.info("[%s] registration: name=%r", self.ctx.session_id, name)
+
+        prompt = registration.line("ask_pin", lang_code, name=name, n=n)
+        for _ in range(2):
+            pin = await self._ask_pin(prompt)
+            if pin is None:
+                break
+            again = await self._ask_pin(registration.line("confirm_pin", lang_code))
+            if again is None:
+                break
+            if again == pin:
+                user = await db.create_user(
+                    phone=self.caller_number or "",
+                    name=name,
+                    pin=pin,
+                    language=self.ctx.preferred_lang,
+                )
+                if user is None:
+                    break
+                self.ctx.user_id = user.id
+                self.ctx.user_status = "new_registration"
+                await db.set_call_user(self.ctx.call_db_id, user.id, "new_registration")
+                log.info(
+                    "[%s] registration: saved user id=%s phone=%s",
+                    self.ctx.session_id,
+                    user.id,
+                    self.caller_number,
+                )
+                await self._ask_profile_questions(user.id)
+                if self._closed:
+                    return ""
+                return registration.line("registered", lang_code, name=name)
+            prompt = registration.line("pin_mismatch", lang_code, n=n)
+        if self._closed:
+            return ""
+        log.info("[%s] registration: PIN not set; continuing as guest", self.ctx.session_id)
+        return registration.line("reg_skipped", lang_code)
+
+    async def _verify_returning_caller(self, user: db.User) -> str | None:
+        """PIN check for a registered caller. None = failed (complaint not taken)."""
+        lang_code = self._reg_lang()
+        n = self.settings.pin_length
+        prompt = registration.line("verify_ask", lang_code, name=user.name, n=n)
+        for attempt in range(3):
+            pin = await self._ask_pin(prompt, attempts=2)
+            if self._closed:
+                return None
+            if pin and db.verify_pin(pin, user.pin_hash):
+                self.ctx.user_status = "verified"
+                await db.set_call_user(self.ctx.call_db_id, user.id, "verified")
+                log.info("[%s] caller verified user id=%s", self.ctx.session_id, user.id)
+                return registration.line("verified", lang_code, name=user.name)
+            log.info("[%s] PIN check failed (attempt %s)", self.ctx.session_id, attempt + 1)
+            prompt = registration.line("verify_wrong", lang_code)
+        self.ctx.user_status = "pin_failed"
+        await db.set_call_user(self.ctx.call_db_id, user.id, "pin_failed")
+        await self.say_text(
+            registration.line("verify_failed", lang_code), record_in_session=False, trim=False
+        )
+        return None
+
+    async def _identify_caller(self) -> str:
+        """
+        Look the caller up by caller id before greeting (no questions asked).
+        Registered -> greet and talk to them by name; otherwise the normal greeting.
+        """
+        user = await db.get_user_by_phone(self.caller_number) if db.available() else None
+        if user is not None:
+            self.ctx.user_id = user.id
+            self.ctx.caller_name = user.name
+            self.ctx.user_status = "registered"
+            await db.set_call_user(self.ctx.call_db_id, user.id, "registered")
+            log.info(
+                "[%s] registered caller user id=%s name=%r", self.ctx.session_id, user.id, user.name
+            )
+            return registration.line("welcome_back", self._reg_lang(), name=user.name)
+        return voice_select.opening_greeting_for_call(
+            self.settings,
+            self.ctx.preferred_lang,
+            neutral_until_confident=self.ctx.gender_grammar_until_confident,
+            caller_name=self.caller_name,
+        )
+
+    async def _complaint_gate(self, user_text: str) -> None:
+        """
+        Caller wants to lodge a complaint: register them first if unknown (name + PIN),
+        or check their PIN if AUTH_VERIFY_PIN. Runs at most once per call; afterwards
+        the normal reply handles the complaint itself.
+        """
+        if self._complaint_gate_done or not registration.wants_complaint(user_text):
+            return
+        if not db.available() or not self.caller_number:
+            return
+        self._complaint_gate_done = True
+        if self.ctx.user_id is None:
+            if not self.settings.registration_enabled:
+                return
+            log.info("[%s] complaint from unregistered caller: registering", self.ctx.session_id)
+            closing = await self._register_new_caller()
+        elif self.settings.auth_verify_pin and self.ctx.user_status != "verified":
+            user = await db.get_user_by_phone(self.caller_number)
+            closing = await self._verify_returning_caller(user) if user else ""
+            closing = closing or ""
+        else:
+            return
+        if closing and not self._closed:
+            await self.say_text(closing, record_in_session=False, trim=False)
+
     async def run_loop(self) -> None:
         try:
             log.info(
@@ -1610,12 +2097,10 @@ class CallSession:
             )
             await self.answer()
             await self._setup_live_vad()
-            opening = voice_select.opening_greeting_for_call(
-                self.settings,
-                self.ctx.preferred_lang,
-                neutral_until_confident=self.ctx.gender_grammar_until_confident,
-                caller_name=self.caller_name,
-            )
+            await self._db_call_started()
+            await self._start_call_recording()
+            # Registered caller? greet by name. Unknown? normal greeting (no questions).
+            opening = await self._identify_caller()
             if lang.is_latin_english_content(opening, min_words=2):
                 self.ctx.preferred_lang = "en"
             log.info(
@@ -1852,6 +2337,11 @@ class CallSession:
                     )
                     grammar = self.ctx.resolved_grammar_gender()
 
+                    # Complaint from an unregistered caller -> name + PIN first, then reply.
+                    await self._complaint_gate(user_text)
+                    if self._closed:
+                        break
+
                     # Own documents first; web only when they have nothing relevant.
                     web_context = await self._knowledge_context(user_text)
                     web_s, web_from_cache = 0.0, False
@@ -1983,3 +2473,5 @@ class CallSession:
         finally:
             await self._teardown_live_vad()
             await self.hangup()
+            await self._db_call_ended()
+            await self._finish_call_recording()

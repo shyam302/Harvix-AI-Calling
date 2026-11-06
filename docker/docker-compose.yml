@@ -26,3 +26,39 @@ services:
       # The bot writes TTS WAVs here (ASTERISK_SOUNDS_EN in project .env); Asterisk plays them.
       - ./data/sounds:/var/lib/asterisk/sounds/en
       - ./data/logs:/var/log/asterisk
+
+  # RAG vector store: Redis Stack (RediSearch HNSW index). Bot uses RAG_STORE=redis.
+  redis:
+    image: ${REDIS_IMAGE:-redis/redis-stack-server:7.4.0-v3}
+    container_name: callbot-redis
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+    environment:
+      REDIS_ARGS: "--appendonly yes --requirepass ${REDIS_PASSWORD:-callbot}"
+    volumes:
+      - redis-data:/data
+
+  # Users (registration) + call history. Bot uses DATABASE_URL.
+  postgres:
+    image: ${POSTGRES_IMAGE:-postgres:17-alpine}
+    container_name: callbot-postgres
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-callbot}
+      POSTGRES_USER: ${POSTGRES_USER:-callbot}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-callbot}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-callbot} -d ${POSTGRES_DB:-callbot}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  redis-data:
+  postgres-data:

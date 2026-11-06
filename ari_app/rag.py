@@ -7,6 +7,9 @@ multilingual model (intfloat/multilingual-e5-small), so a caller asking in Hindi
 still finds an English document. The index lives in ``<docs>/.rag_index/`` and only
 changed files are re-embedded.
 
+RAG_STORE=redis keeps the chunks in Redis Stack instead (see rag_redis.py); the
+local store is the fallback when Redis is unreachable.
+
 Each caller turn is matched against the chunks (dense similarity, plus BM25 keyword
 scores to help with names, codes and numbers). Strong matches go to the LLM as
 reference text; when nothing relevant is found, the call carries on as before
@@ -333,7 +336,17 @@ def get_knowledge_base(docs_dir: str | Path, *, model_name: str) -> KnowledgeBas
             if not path.is_absolute():
                 # Relative to the project root, not wherever the bot was started.
                 path = Path(__file__).resolve().parent.parent / path
-            _kb = KnowledgeBase(path, model_name=model_name)
+            store = os.getenv("RAG_STORE", "local").strip().lower()
+            if store == "redis":
+                from ari_app.rag_redis import make_redis_kb
+
+                _kb = make_redis_kb(
+                    path,
+                    redis_url=os.getenv("REDIS_URL", "redis://localhost:6379/0"),
+                    model_name=model_name,
+                )
+            if _kb is None:
+                _kb = KnowledgeBase(path, model_name=model_name)
         return _kb
 
 
@@ -352,12 +365,12 @@ def _main() -> None:
     s.add_argument("-k", type=int, default=3)
     args = parser.parse_args()
 
-    kb = KnowledgeBase(
-        Path(os.getenv("RAG_DOCS_DIR", "knowledge")),
+    kb = get_knowledge_base(
+        os.getenv("RAG_DOCS_DIR", "knowledge"),
         model_name=os.getenv("RAG_EMBED_MODEL", "intfloat/multilingual-e5-small"),
     )
     kb.refresh()
-    print(f"{len(kb.chunks)} chunks from {len(kb.manifest)} files in {kb.docs_dir}")
+    print(f"{len(kb.chunks)} chunks in {type(kb).__name__} from {kb.docs_dir}")
     if args.cmd == "search":
         min_score = float(os.getenv("RAG_MIN_SCORE", "0.82"))
         hits = kb.search(args.query, top_k=args.k, min_score=0.0)

@@ -49,6 +49,12 @@ class CallContext:
     last_web_query: str | None = None
     last_web_context: str | None = None
     last_web_at: float = 0.0
+    # Database (ari_app/db.py): row ids and registration outcome for this call
+    call_db_id: int | None = None
+    user_id: int | None = None
+    user_status: str = "guest"  # registered | verified | new_registration | guest | pin_failed
+    # Called as listener(role, text) for every line added to history (call log in DB)
+    message_listener: Any = field(default=None, repr=False)
     _logged_grammar_unlock: bool = field(default=False, repr=False)
 
     @classmethod
@@ -377,6 +383,8 @@ class CallContext:
             return
         self.messages.append({"role": "assistant", "content": t})
         self._trim()
+        if self.message_listener:
+            self.message_listener("assistant", t)
 
     def add_user(self, text: str) -> None:
         t = (text or "").strip()
@@ -384,6 +392,8 @@ class CallContext:
             return
         self.messages.append({"role": "user", "content": t})
         self._trim()
+        if self.message_listener:
+            self.message_listener("user", t)
 
     def _trim(self) -> None:
         if len(self.messages) > self.max_messages:
@@ -402,6 +412,10 @@ class CallContext:
         parts: list[str] = []
         if self.caller_name and self.caller_name not in ("-", "unknown"):
             parts.append(f"name {self.caller_name}")
+        if self.user_status in ("registered", "verified"):
+            parts.append("registered customer")
+        elif self.user_status == "new_registration":
+            parts.append("just registered on this call")
         if self.caller_number:
             parts.append(f"id {self.caller_number}")
         if self.dialed_number:
