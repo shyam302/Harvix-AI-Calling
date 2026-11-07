@@ -147,6 +147,7 @@ After registration (or straight away for a registered caller), the bot asks the 
 
 - **Default questions:** `category` (a choice of order, delivery, payment, product quality, customer service or other), `order_number` (optional, spoken or typed) and `description` (type `free`: the caller's own words, kept as said).
 - **Format:** the same as the registration questions, plus the `free` type. Edit the file and restart the bot to change them.
+- **Returning callers with open complaints** hear "I see you have an open complaint, ticket … about delivery. Would you like an update on it, or do you want to lodge a new complaint?" "Update" reads out the ticket status, "new" takes a new complaint, and anything else carries on as a normal conversation. Ticket statuses (`open`, `in_progress`, `resolved`, `closed`) are read out as they are in the database.
 - **Guests too:** callers who skip registration can still lodge a complaint; it's saved against their caller number.
 - **Where to see them:** in the database, or on the call's page at `/recordings`, which shows the ticket and the answers.
 
@@ -168,7 +169,7 @@ docker exec -it callbot-postgres psql -U callbot
 docker exec -it callbot-redis redis-cli -a callbot FT.INFO rag_idx    # num_docs = chunks
 ```
 
-[docs/DB_SUPPORT.md](docs/DB_SUPPORT.md) has the design, test results and what's not done yet.
+[docs/CUSTOMIZING.md](docs/CUSTOMIZING.md) explains which file to edit to change prompts and fixed sentences, how to add registration or complaint questions, and how ticket statuses work. [docs/DB_SUPPORT.md](docs/DB_SUPPORT.md) has the design, test results and what's not done yet.
 
 ## Known issues
 
@@ -177,7 +178,7 @@ docker exec -it callbot-redis redis-cli -a callbot FT.INFO rag_idx    # num_docs
 - **G.722 (HD audio) can sound slow and garbled.** G.722 advertises an 8 kHz clock although the audio is 16 kHz, and some softphones get this wrong. The Docker setup therefore offers `CODECS=ulaw,alaw,g722`. To try HD audio, set `CODECS=g722,ulaw,alaw` in `docker/.env` and enable G.722 in the softphone, then switch back if playback sounds off.
 - **Small LLMs make things up.** The prompt pushes the model to search rather than guess, but a 2B model still gets things wrong now and then. Don't use this for anything where a wrong answer matters.
 - **Callers are identified by caller id.** Anyone calling from a registered number is treated as that person unless `AUTH_VERIFY_PIN=true`. There's no PIN reset yet.
-- **Complaints can't be followed up yet.** Tickets are created with status `open`, but there's no way to update them, and the bot can't yet answer "what's the status of ticket 100003?".
+- **Ticket statuses are changed by hand.** The bot reads a caller's open tickets, but there's no admin page to change a status yet; use SQL (see [docs/CUSTOMIZING.md](docs/CUSTOMIZING.md)).
 - **Recordings are kept forever.** There's no retention or automatic clean-up.
 - **Only tested on a LAN.** Calling over the internet or Tailscale needs `external_media_address` set up in PJSIP (there are notes in the snippet), and you should lock down SIP and ARI first.
 - **Asterisk installed twice.** If you have both the distro Asterisk package and a source build, make sure the binary loads its own `libasteriskpj`. A mismatched PJSIP library crashed Asterisk on every SIP REGISTER here.
@@ -195,7 +196,7 @@ docker/               Asterisk + Redis + PostgreSQL in Docker
 knowledge/            your documents for the knowledge base (git-ignored)
 recordings/           compressed call recordings (git-ignored)
 asterisk_snippets/    example configs for a system Asterisk
-docs/                 call flow walkthrough (CALL_FLOW.md), database notes (DB_SUPPORT.md)
+docs/                 call flow (CALL_FLOW.md), database notes (DB_SUPPORT.md), customizing (CUSTOMIZING.md)
 registration_questions.json   extra questions asked when a caller registers
 complaint_questions.json      questions asked when a caller lodges a complaint
 tts/                  TTS test scripts

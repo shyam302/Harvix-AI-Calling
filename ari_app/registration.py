@@ -155,6 +155,34 @@ def wants_complaint(text: str) -> bool:
     return bool(_COMPLAINT.search(text or ""))
 
 
+# Reply to "update on your existing complaint, or a new one?"
+_EXISTING = re.compile(
+    r"\b(existing|old|older|previous|earlier|last|that one|same|status|update|"
+    r"progress|track|purani|purana|pichli|pichla|wali|wahi)\b|पुरानी|पुराना|पिछली|पिछला|स्टेटस|अपडेट",
+    re.IGNORECASE,
+)
+_NEW = re.compile(
+    r"\b(new|another|different|fresh|one more|naya|nayi|nai|dusri|doosri|aur ek)\b|नई|नया|दूसरी|दूसरा",
+    re.IGNORECASE,
+)
+
+
+def complaint_choice(text: str) -> str | None:
+    """'existing', 'new', or None when the reply is about something else / unclear."""
+    t = text or ""
+    is_new, is_old = bool(_NEW.search(t)), bool(_EXISTING.search(t))
+    if is_new and not is_old:
+        return "new"
+    if is_old and not is_new:
+        return "existing"
+    if is_new and is_old:
+        # "not the old one, a new one" -> whichever is mentioned last wins
+        last_new = max(m.end() for m in _NEW.finditer(t))
+        last_old = max(m.end() for m in _EXISTING.finditer(t))
+        return "new" if last_new > last_old else "existing"
+    return None
+
+
 # extra registration questions (registration_questions.json)
 
 _QUESTIONS_FILE = Path(__file__).resolve().parent.parent / "registration_questions.json"
@@ -304,6 +332,14 @@ _LINES = {
         "registered": "Thank you, {name}, you're registered. Please remember your PIN.",
         "pin_saved": "Thank you, your PIN is saved. Just {k} quick questions more.",
         "complaint_start": "Okay, let me take down your complaint.",
+        "offer_one": "Welcome back, {name}! I see you have an open complaint, ticket {ticket}, about {topic}. Would you like an update on it, or do you want to lodge a new complaint?",
+        "offer_many": "Welcome back, {name}! I see you have {count} open complaints, the latest is ticket {ticket}, about {topic}. Would you like an update on them, or do you want to lodge a new complaint?",
+        "status_item": "Ticket {ticket}, about {topic}, raised on {date}, is {status}.",
+        "status_order": "The order number on it is {order}.",
+        "status_end": "Our team is working on it. Is there anything else I can help you with?",
+        "status_open": "still open",
+        "status_in_progress": "being worked on",
+        "status_resolved": "resolved",
         "complaint_saved": "Your complaint is registered. Your ticket number is {ticket}. Is there anything else I can help you with?",
         "complaint_failed": "Sorry, I couldn't save the complaint right now. Please call again a little later.",
         "complaint_no_pin": "Without verifying your PIN I can't take a complaint. Is there anything else I can help with?",
@@ -326,6 +362,14 @@ _LINES = {
         "registered": "धन्यवाद, {name}, आपका रजिस्ट्रेशन हो गया। अपना पिन याद रखिए।",
         "pin_saved": "धन्यवाद, आपका पिन सेव हो गया। बस {k} छोटे सवाल और।",
         "complaint_start": "ठीक है, मैं आपकी शिकायत दर्ज करती हूँ।",
+        "offer_one": "फिर से स्वागत है, {name}! आपकी एक शिकायत खुली है, टिकट {ticket}, {topic} के बारे में। क्या आप उसका अपडेट जानना चाहेंगे, या नई शिकायत दर्ज करनी है?",
+        "offer_many": "फिर से स्वागत है, {name}! आपकी {count} शिकायतें खुली हैं, सबसे नई टिकट {ticket} है, {topic} के बारे में। क्या आप उनका अपडेट जानना चाहेंगे, या नई शिकायत दर्ज करनी है?",
+        "status_item": "टिकट {ticket}, {topic} के बारे में, {date} को दर्ज हुई थी, और अभी {status} है।",
+        "status_order": "इस पर ऑर्डर नंबर {order} है।",
+        "status_end": "हमारी टीम इस पर काम कर रही है। क्या मैं और कुछ मदद कर सकती हूँ?",
+        "status_open": "खुली",
+        "status_in_progress": "प्रगति पर",
+        "status_resolved": "हल हो चुकी",
         "complaint_saved": "आपकी शिकायत दर्ज हो गई है। आपका टिकट नंबर है {ticket}। क्या मैं और कुछ मदद कर सकती हूँ?",
         "complaint_failed": "माफ़ कीजिए, अभी शिकायत सेव नहीं हो पाई। कृपया थोड़ी देर बाद फिर कॉल करें।",
         "complaint_no_pin": "पिन की पुष्टि के बिना मैं शिकायत नहीं ले सकती। क्या मैं और कुछ मदद कर सकती हूँ?",

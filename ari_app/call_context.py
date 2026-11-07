@@ -55,6 +55,7 @@ class CallContext:
     user_status: str = "guest"  # registered | verified | new_registration | guest | pin_failed
     # Called as listener(role, text) for every line added to history (call log in DB)
     message_listener: Any = field(default=None, repr=False)
+    open_tickets: list[str] = field(default_factory=list)  # e.g. "100003 (delivery, open, 6 Nov)"
     _logged_grammar_unlock: bool = field(default=False, repr=False)
 
     @classmethod
@@ -416,6 +417,8 @@ class CallContext:
             parts.append("registered customer")
         elif self.user_status == "new_registration":
             parts.append("just registered on this call")
+        if self.open_tickets:
+            parts.append("open complaints: " + "; ".join(self.open_tickets))
         if self.caller_number:
             parts.append(f"id {self.caller_number}")
         if self.dialed_number:

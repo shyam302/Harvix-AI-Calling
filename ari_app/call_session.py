@@ -273,6 +273,10 @@ class CallSession:
         self._vad_bridge: str | None = None
         self._db_tasks: set[asyncio.Task[None]] = set()
         self._complaint_gate_done = False
+        # Open complaints found at call start; the first reply is checked for
+        # "update on the existing one" vs "a new one".
+        self._open_complaints: list[dict] = []
+        self._awaiting_complaint_choice = False
         self._rec_channel: str | None = None  # snoop (spy=both) recorded for the whole call
         self._rec_name: str | None = None
         self._rec_started_at = None
@@ -468,6 +472,7 @@ class CallSession:
             vad = await live_vad.open_listener(
                 end_silence_ms=self.settings.vad_end_silence_ms,
                 speech_threshold=self.settings.vad_speech_threshold,
+                min_speech_ms=self.settings.vad_min_speech_ms,
                 no_speech_timeout_s=self.settings.vad_no_speech_timeout_s,
                 barge_threshold=self.settings.barge_in_threshold,
                 barge_min_speech_ms=self.settings.barge_in_min_speech_ms,
@@ -2059,6 +2064,30 @@ class CallSession:
             log.info(
                 "[%s] registered caller user id=%s name=%r", self.ctx.session_id, user.id, user.name
             )
+            complaints = await db.open_complaints(user.id, self.caller_number)
+            if complaints:
+                self._open_complaints = complaints
+                self._awaiting_complaint_choice = True
+                self.ctx.open_tickets = [
+                    f"{c['ticket_no']} ({c['details'].get('category', 'complaint')}, "
+                    f"{c['status']}, {c['created_at']:%d %b})"
+                    for c in complaints
+                ]
+                latest = complaints[0]
+                log.info(
+                    "[%s] caller has %s open complaint(s), latest %s",
+                    self.ctx.session_id,
+                    len(complaints),
+                    latest["ticket_no"],
+                )
+                return registration.line(
+                    "offer_one" if len(complaints) == 1 else "offer_many",
+                    self._reg_lang(),
+                    name=user.name,
+                    count=len(complaints),
+                    ticket=registration.speak_ticket(latest["ticket_no"]),
+                    topic=self._complaint_topic(latest),
+                )
             return registration.line("welcome_back", self._reg_lang(), name=user.name)
         return voice_select.opening_greeting_for_call(
             self.settings,
@@ -2067,7 +2096,57 @@ class CallSession:
             caller_name=self.caller_name,
         )
 
-    async def _complaint_gate(self, user_text: str) -> bool:
+    def _complaint_topic(self, c: dict) -> str:
+        return c["details"].get("category") or ("शिकायत" if self._reg_lang() == "hi" else "your issue")
+
+    async def _tell_complaint_status(self, user_text: str) -> None:
+        """Read out the open complaints found at call start (max 3)."""
+        lang_code = self._reg_lang()
+        parts = []
+        for c in self._open_complaints[:3]:
+            status_key = f"status_{c['status']}"
+            try:
+                status = registration.line(status_key, lang_code)
+            except KeyError:
+                status = c["status"].replace("_", " ")
+            parts.append(
+                registration.line(
+                    "status_item",
+                    lang_code,
+                    ticket=registration.speak_ticket(c["ticket_no"]),
+                    topic=self._complaint_topic(c),
+                    date=f"{c['created_at']:%d %B}".lstrip("0"),
+                    status=status,
+                )
+            )
+            order = c["details"].get("order_number")
+            if order:
+                parts.append(
+                    registration.line("status_order", lang_code, order=registration.speak_ticket(order))
+                )
+        parts.append(registration.line("status_end", lang_code))
+        line = " ".join(parts)
+        log.info("[%s] told caller the status of %s complaint(s)", self.ctx.session_id, len(self._open_complaints[:3]))
+        await self.say_text(line, record_in_session=False, trim=False)
+        self.ctx.add_user(user_text)
+        self.ctx.add_assistant(line)
+
+    async def _handle_complaint_choice(self, user_text: str) -> bool:
+        """
+        First reply after "update on the existing complaint, or a new one?".
+        Returns True when the turn was handled (status read out / new complaint taken).
+        """
+        self._awaiting_complaint_choice = False
+        choice = registration.complaint_choice(user_text)
+        log.info("[%s] complaint choice: %s", self.ctx.session_id, choice or "neither")
+        if choice == "existing":
+            await self._tell_complaint_status(user_text)
+            return True
+        if choice == "new":
+            return await self._complaint_gate(user_text, force=True)
+        return False  # about something else: normal reply
+
+    async def _complaint_gate(self, user_text: str, *, force: bool = False) -> bool:
         """
         Caller wants to lodge a complaint (at most once per call):
           1. unknown caller -> register (name, PIN, profile questions); may be skipped
@@ -2076,7 +2155,7 @@ class CallSession:
           3. read out the ticket number
         Returns True when the turn was handled here (no LLM reply needed).
         """
-        if self._complaint_gate_done or not registration.wants_complaint(user_text):
+        if self._complaint_gate_done or not (force or registration.wants_complaint(user_text)):
             return False
         if not db.available():
             return False
@@ -2185,7 +2264,7 @@ class CallSession:
                 self._use_llm_streaming(),
             )
             # No language question: the bot answers in whatever language the caller uses.
-            await self.say_text(opening, is_opening=True)
+            await self.say_text(opening, is_opening=True, trim=False)
 
             while not self._closed:
                 wav_path: Path | None = None
@@ -2408,6 +2487,14 @@ class CallSession:
                         stt_s,
                     )
                     grammar = self.ctx.resolved_grammar_gender()
+
+                    # Caller with open complaints was asked "update or new?" in the greeting.
+                    if self._awaiting_complaint_choice and await self._handle_complaint_choice(
+                        user_text
+                    ):
+                        if self._closed:
+                            break
+                        continue
 
                     # Complaint -> (register / verify) -> complaint questions -> ticket.
                     if await self._complaint_gate(user_text):

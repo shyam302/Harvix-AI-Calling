@@ -53,6 +53,7 @@ class Settings:
     opening_greeting_dynamic: bool  # varied line each call when OPENING_GREETING empty
     record_max_silence_seconds: float
     record_format: str  # wav16 keeps G.722 wideband audio for Whisper; falls back to wav
+    vad_min_speech_ms: int  # shortest speech that counts as a turn ("skip", "no" are ~150-200 ms)
     vad_enabled: bool  # end turns with Silero VAD on live caller audio (snoop + RTP)
     vad_end_silence_ms: int  # silence after speech that ends the caller's turn
     vad_speech_threshold: float
@@ -263,6 +264,7 @@ def load_settings() -> Settings:
         vad_enabled=os.getenv("VAD_ENABLED", "true").strip().lower()
         not in ("0", "false", "no", "off"),
         vad_end_silence_ms=_int_env("VAD_END_SILENCE_MS", 700),
+        vad_min_speech_ms=_int_env("VAD_MIN_SPEECH_MS", 100),
         vad_speech_threshold=_float_env("VAD_SPEECH_THRESHOLD", 0.5),
         vad_no_speech_timeout_s=_float_env("VAD_NO_SPEECH_TIMEOUT_SECONDS", 8.0),
         barge_in_enabled=os.getenv("BARGE_IN_ENABLED", "true").strip().lower()

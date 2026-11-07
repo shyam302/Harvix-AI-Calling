@@ -457,3 +457,38 @@ async def complaints_for_call(call_id: int) -> list[dict]:
         return [dict(r) for r in rows]
 
     return await _run("complaints_for_call", q, default=[])
+
+
+async def open_complaints(user_id: int | None, caller_number: str | None, limit: int = 5) -> list[dict]:
+    """Complaints that are not closed, newest first (by user, else by caller number)."""
+    if user_id is None and not caller_number:
+        return []
+
+    async def q(con):
+        rows = await con.fetch(
+            """
+            SELECT ticket_no, status, summary, details::text AS details, created_at
+              FROM complaints
+             WHERE status <> 'closed'
+               AND (($1::bigint IS NOT NULL AND user_id = $1)
+                    OR ($1::bigint IS NULL AND caller_number = $2))
+             ORDER BY created_at DESC
+             LIMIT $3
+            """,
+            user_id,
+            caller_number,
+            limit,
+        )
+        out = []
+        for r in rows:
+            d = dict(r)
+            try:
+                import json
+
+                d["details"] = json.loads(d["details"] or "{}")
+            except ValueError:
+                d["details"] = {}
+            out.append(d)
+        return out
+
+    return await _run("open_complaints", q, default=[])
