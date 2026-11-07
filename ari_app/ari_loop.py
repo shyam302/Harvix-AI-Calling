@@ -165,6 +165,15 @@ async def run_ari_forever() -> None:
                 sessions[cid].on_dtmf(ev.get("digit") or "")
             return
 
+        if et in ("StasisEnd", "ChannelHangupRequest"):
+            # The caller hung up (or the channel left the app): stop at once instead
+            # of finding out on the next failed ARI request.
+            cid = (ev.get("channel") or {}).get("id")
+            if cid and cid in sessions:
+                log.info("Caller hung up channel=%s (%s)", cid, et)
+                sessions[cid].mark_channel_dead()
+            return
+
         if et == "ChannelDestroyed":
             ch = ev.get("channel") or {}
             cid = ch.get("id")

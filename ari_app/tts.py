@@ -83,7 +83,7 @@ def _ensure_engine() -> Any:
             # CUDA pip libs must be on LD_LIBRARY_PATH before onnxruntime / supertonic load.
             lib_dirs = ensure_cuda_library_path()
             if lib_dirs:
-                log.info("Supertonic CUDA libs: %s", lib_dirs)
+                log.debug("Supertonic CUDA libs: %s", lib_dirs)
             configure_supertonic_onnx()
 
             from supertonic import TTS

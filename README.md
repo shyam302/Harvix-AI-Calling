@@ -130,7 +130,8 @@ Start them with `cd docker && docker compose up -d redis postgres`. The tables a
 
 ### Callers and registration
 
-- **Returning callers:** the caller id (for example `1001`) is looked up in `users` when the call starts. If it's found, the bot greets them by name and keeps using the name. Nobody is asked anything up front.
+- **Returning callers:** the caller id (for example `1001`) is looked up in `users` when the call starts. A registered caller is asked for their **PIN** first (spoken or typed; `VERIFY_PIN_ON_CALL=true`). Once verified, the bot uses their name and tells them about any open complaints itself. With a wrong PIN, no account details are shared on that call.
+- **Ending the call:** when the caller sounds done ("that's all", "bye", "no" after "anything else?"), the bot asks "Shall I end the call now?", says goodbye and hangs up.
 - **Registration happens only when it's needed:** when an unregistered caller wants to lodge a complaint ("complaint", "lodge", "शिकायत"…). The bot asks for their name, then a PIN twice. The caller can say the PIN or type it: four digits finish the entry, `#` ends it early, `*` clears. Then the bot goes back to the complaint.
 - **Extra questions:** after the PIN, the bot asks the questions in [registration_questions.json](registration_questions.json) (by default city and an alternate phone number) and saves each answer to `users.profile` as soon as it's given. A question can be:
   - `text`: the LLM pulls the answer out of the reply,
@@ -169,7 +170,16 @@ docker exec -it callbot-postgres psql -U callbot
 docker exec -it callbot-redis redis-cli -a callbot FT.INFO rag_idx    # num_docs = chunks
 ```
 
-[docs/CUSTOMIZING.md](docs/CUSTOMIZING.md) explains which file to edit to change prompts and fixed sentences, how to add registration or complaint questions, and how ticket statuses work. [docs/DB_SUPPORT.md](docs/DB_SUPPORT.md) has the design, test results and what's not done yet.
+### Customers and complaints page
+
+Open **http://127.0.0.1:8765/customers** while the bot is running. It has two tabs:
+
+- **Customers:** search by name, phone or profile answers. Selecting a customer shows their details (phone, language, the answers to the registration questions), all their complaints and their recent calls, with links to the recordings.
+- **Complaints:** every ticket, filterable by status and searchable by ticket number, name, phone or description. Each ticket shows its category, order number, description and the customer's first sentence, with a link to the call recording.
+
+Each ticket has a **"Resolution / message to customer"** box: the bot reads it out word for word when the customer asks about that complaint. Each ticket also has a **status dropdown** (open, in progress, resolved, closed). Changing it saves immediately, and the bot reads out the new status the next time that customer calls; closed tickets are no longer mentioned. Like the recordings page, it has no login and only listens on localhost.
+
+[docs/CUSTOMIZING.md](docs/CUSTOMIZING.md) explains which file to edit to change prompts and fixed sentences, how to add registration or complaint questions, how ticket statuses and resolution notes work, and walks through keypad (DTMF) input and the hang-up logic line by line. [docs/DB_SUPPORT.md](docs/DB_SUPPORT.md) has the design, test results and what's not done yet.
 
 ## Known issues
 
@@ -178,7 +188,7 @@ docker exec -it callbot-redis redis-cli -a callbot FT.INFO rag_idx    # num_docs
 - **G.722 (HD audio) can sound slow and garbled.** G.722 advertises an 8 kHz clock although the audio is 16 kHz, and some softphones get this wrong. The Docker setup therefore offers `CODECS=ulaw,alaw,g722`. To try HD audio, set `CODECS=g722,ulaw,alaw` in `docker/.env` and enable G.722 in the softphone, then switch back if playback sounds off.
 - **Small LLMs make things up.** The prompt pushes the model to search rather than guess, but a 2B model still gets things wrong now and then. Don't use this for anything where a wrong answer matters.
 - **Callers are identified by caller id.** Anyone calling from a registered number is treated as that person unless `AUTH_VERIFY_PIN=true`. There's no PIN reset yet.
-- **Ticket statuses are changed by hand.** The bot reads a caller's open tickets, but there's no admin page to change a status yet; use SQL (see [docs/CUSTOMIZING.md](docs/CUSTOMIZING.md)).
+- **The admin pages have no login.** `/customers` and `/recordings` only listen on localhost; add authentication before exposing them.
 - **Recordings are kept forever.** There's no retention or automatic clean-up.
 - **Only tested on a LAN.** Calling over the internet or Tailscale needs `external_media_address` set up in PJSIP (there are notes in the snippet), and you should lock down SIP and ARI first.
 - **Asterisk installed twice.** If you have both the distro Asterisk package and a source build, make sure the binary loads its own `libasteriskpj`. A mismatched PJSIP library crashed Asterisk on every SIP REGISTER here.

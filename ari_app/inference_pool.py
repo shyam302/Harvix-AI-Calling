@@ -28,11 +28,18 @@ def configure(
 ) -> None:
     """Call once at process startup (before handling calls)."""
     global _executor, _whisper_sem, _tts_sem, _whisper_slots, _tts_slots, _thread_workers
-    _whisper_slots = max(1, whisper_max_concurrent)
-    _tts_slots = max(1, tts_max_concurrent)
+    whisper_slots = max(1, whisper_max_concurrent)
+    tts_slots = max(1, tts_max_concurrent)
     workers = thread_workers
     if workers is None:
-        workers = max(4, _whisper_slots + _tts_slots + 2)
+        workers = max(4, whisper_slots + tts_slots + 2)
+    if _executor is not None and (whisper_slots, tts_slots, workers) == (
+        _whisper_slots,
+        _tts_slots,
+        _thread_workers,
+    ):
+        return  # already set up with these settings (server startup + ARI loop)
+    _whisper_slots, _tts_slots = whisper_slots, tts_slots
     if _executor is not None:
         _executor.shutdown(wait=False, cancel_futures=True)
     _thread_workers = workers

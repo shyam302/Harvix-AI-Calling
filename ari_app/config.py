@@ -66,7 +66,8 @@ class Settings:
     rag_min_score: float  # similarity needed to use a chunk (0.82 suits multilingual-e5)
     database_url: str  # PostgreSQL for users + call history; empty = off
     registration_enabled: bool  # ask unknown callers for name + PIN
-    auth_verify_pin: bool  # registered callers must say their PIN first
+    auth_verify_pin: bool  # registered callers must say their PIN before a complaint
+    verify_pin_on_call: bool  # registered callers must say their PIN at the start of the call
     pin_length: int
     call_recording_enabled: bool  # record whole calls (both voices) to RECORDINGS_DIR
     recordings_dir: str
@@ -281,6 +282,8 @@ def load_settings() -> Settings:
         registration_enabled=os.getenv("REGISTRATION_ENABLED", "true").strip().lower()
         not in ("0", "false", "no", "off"),
         auth_verify_pin=os.getenv("AUTH_VERIFY_PIN", "false").strip().lower()
+        in ("1", "true", "yes", "on"),
+        verify_pin_on_call=os.getenv("VERIFY_PIN_ON_CALL", "true").strip().lower()
         in ("1", "true", "yes", "on"),
         pin_length=max(3, min(8, _int_env("PIN_LENGTH", 4))),
         call_recording_enabled=os.getenv("CALL_RECORDING_ENABLED", "true").strip().lower()

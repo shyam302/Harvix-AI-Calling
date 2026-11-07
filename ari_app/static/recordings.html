@@ -63,7 +63,7 @@
 </head>
 <body>
 <header>
-  <h1>Call recordings</h1>
+  <h1>Call recordings <a href="/customers" style="font-size:14px;font-weight:400;color:var(--accent);text-decoration:none;margin-left:12px">Customers and complaints →</a></h1>
   <p class="sub">Every call with its recording (Opus, compressed) and transcript. Search by number, name or anything said.</p>
 </header>
 <div class="wrap">
@@ -188,6 +188,9 @@ async function show(id) {
 qEl.oninput = () => { clearTimeout(timer); timer = setTimeout(() => load(true), 300); };
 document.getElementById("refresh").onclick = () => load(true);
 load(true);
+// /recordings#call-12 (links from the customers page) opens that call directly
+const m = location.hash.match(/^#call-(\d+)$/);
+if (m) show(+m[1]);
 </script>
 </body>
 </html>

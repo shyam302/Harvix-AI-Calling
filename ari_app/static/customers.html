@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Customers and Complaints</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #fff; --text: #1d2330; --muted: #6b7280;
+    --line: #e5e7eb; --accent: #0f766e; --accent-soft: #e6f4f2;
+    --open: #b45309; --open-soft: #fef3c7; --prog: #1d4ed8; --prog-soft: #dbeafe;
+    --done: #15803d; --done-soft: #dcfce7; --closed: #6b7280; --closed-soft: #f3f4f6;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #111418; --card: #1a1f26; --text: #e6e8eb; --muted: #9aa3ad; --line: #2a313b;
+      --accent: #2dd4bf; --accent-soft: #12302d;
+      --open: #fbbf24; --open-soft: #3a2a0a; --prog: #93c5fd; --prog-soft: #172554;
+      --done: #86efac; --done-soft: #0f2e1a; --closed: #9aa3ad; --closed-soft: #232a33;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 15px/1.5 system-ui, sans-serif; background: var(--bg); color: var(--text); }
+  header { max-width: 1200px; margin: 0 auto; padding: 20px 20px 0; display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap; }
+  h1 { font-size: 20px; margin: 0; }
+  nav a { color: var(--accent); font-size: 14px; text-decoration: none; }
+  .tabs { max-width: 1200px; margin: 14px auto 12px; padding: 0 20px; display: flex; gap: 6px; }
+  .tab { border: 1px solid var(--line); background: var(--card); color: var(--text); border-radius: 999px;
+         padding: 6px 14px; font: inherit; font-size: 14px; cursor: pointer; }
+  .tab.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .wrap { max-width: 1200px; margin: 0 auto; padding: 0 20px 40px; display: grid;
+          grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr); gap: 16px; }
+  @media (max-width: 860px) { .wrap { grid-template-columns: 1fr; } }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+  .toolbar { display: flex; gap: 8px; padding: 10px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+  input[type=search], select { padding: 7px 10px; border: 1px solid var(--line); border-radius: 8px;
+    background: var(--bg); color: var(--text); font: inherit; font-size: 14px; }
+  input[type=search] { flex: 1; min-width: 140px; }
+  button { border: 1px solid var(--line); background: transparent; color: var(--text);
+    border-radius: 8px; padding: 6px 12px; font: inherit; font-size: 14px; cursor: pointer; }
+  button:hover { background: var(--bg); }
+  .list { max-height: calc(100vh - 190px); overflow-y: auto; }
+  .row { padding: 10px 14px; border-bottom: 1px solid var(--line); cursor: pointer;
+         display: grid; grid-template-columns: 1fr auto; gap: 2px 12px; }
+  .row:hover { background: var(--bg); }
+  .row.sel { background: var(--accent-soft); }
+  .title { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sub, .meta { color: var(--muted); font-size: 13px; }
+  .meta { text-align: right; white-space: nowrap; }
+  .empty, .error { padding: 18px; color: var(--muted); text-align: center; }
+  .error { color: var(--open); }
+  .pill { display: inline-block; font-size: 12px; padding: 1px 9px; border-radius: 999px; font-weight: 600; }
+  .s-open { color: var(--open); background: var(--open-soft); }
+  .s-in_progress { color: var(--prog); background: var(--prog-soft); }
+  .s-resolved { color: var(--done); background: var(--done-soft); }
+  .s-closed { color: var(--closed); background: var(--closed-soft); }
+  .counts { display: flex; gap: 6px; flex-wrap: wrap; }
+  #detail { padding: 16px; max-height: calc(100vh - 150px); overflow-y: auto; }
+  #detail h2 { font-size: 18px; margin: 0 0 2px; }
+  #detail h3 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 18px 0 8px; }
+  dl { display: grid; grid-template-columns: max-content 1fr; gap: 4px 14px; margin: 8px 0 0; font-size: 14px; }
+  dt { color: var(--muted); }
+  dd { margin: 0; overflow-wrap: anywhere; }
+  .ticket { border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; margin-bottom: 10px; font-size: 14px; }
+  .ticket-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 4px; }
+  .ticket-head b { font-variant-numeric: tabular-nums; }
+  .ticket-head .spacer { flex: 1; }
+  .desc { margin: 6px 0 0; padding: 8px 10px; background: var(--bg); border-radius: 8px; }
+  .calls a { color: var(--accent); }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  td { padding: 5px 4px; border-bottom: 1px solid var(--line); }
+  .saved { color: var(--done); font-size: 12px; }
+  .resolution { margin-top: 10px; }
+  .resolution label { display: block; font-size: 12px; font-weight: 600; color: var(--muted);
+                      text-transform: uppercase; letter-spacing: .04em; margin-bottom: 4px; }
+  .resolution textarea { width: 100%; min-height: 64px; resize: vertical; padding: 8px 10px;
+    border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--text); font: inherit; font-size: 14px; }
+  .resolution .bar { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
+  .resolution .hint { color: var(--muted); font-size: 12px; flex: 1; }
+  .has-res { font-size: 12px; color: var(--accent); margin-left: 6px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Customers and complaints</h1>
+  <nav><a href="/recordings">Call recordings →</a></nav>
+</header>
+<div class="tabs">
+  <button class="tab on" data-tab="customers">Customers</button>
+  <button class="tab" data-tab="complaints">Complaints</button>
+</div>
+<div class="wrap">
+  <div class="card">
+    <div class="toolbar">
+      <input id="q" type="search" placeholder="Search…">
+      <select id="status" hidden>
+        <option value="">All statuses</option>
+        <option value="open">Open</option>
+        <option value="in_progress">In progress</option>
+        <option value="resolved">Resolved</option>
+        <option value="closed">Closed</option>
+      </select>
+      <button id="refresh">Refresh</button>
+    </div>
+    <div class="toolbar counts" id="counts" hidden></div>
+    <div class="list" id="list"><div class="empty">Loading…</div></div>
+  </div>
+  <div class="card" id="detail"><p class="sub">Select a customer or complaint.</p></div>
+</div>
+
+<script>
+const STATUSES = ["open", "in_progress", "resolved", "closed"];
+const LABEL = { open: "Open", in_progress: "In progress", resolved: "Resolved", closed: "Closed" };
+let tab = "customers", selected = null, timer = null;
+const $ = id => document.getElementById(id);
+const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
+const when = iso => iso ? new Date(iso).toLocaleString([], { dateStyle: "medium", timeStyle: "short" }) : "–";
+const day = iso => iso ? new Date(iso).toLocaleDateString([], { dateStyle: "medium" }) : "–";
+const human = k => k.replace(/_/g, " ").replace(/^./, c => c.toUpperCase());
+const dur = s => s == null ? "–" : `${Math.floor(s / 60)}:${String(Math.round(s % 60)).padStart(2, "0")}`;
+const pill = s => el("span", "pill s-" + s, LABEL[s] || s);
+
+async function getJSON(url, opts) {
+  const r = await fetch(url, opts);
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(body.detail || r.statusText);
+  return body;
+}
+
+function setTab(t) {
+  tab = t; selected = null;
+  document.querySelectorAll(".tab").forEach(b => b.classList.toggle("on", b.dataset.tab === t));
+  $("status").hidden = t !== "complaints";
+  $("counts").hidden = t !== "complaints";
+  $("q").placeholder = t === "customers" ? "Search name, phone, city…" : "Search ticket, name, phone, description…";
+  $("detail").innerHTML = ""; $("detail").append(el("p", "sub", "Select a " + (t === "customers" ? "customer." : "complaint.")));
+  load();
+}
+
+async function load() {
+  const list = $("list");
+  list.innerHTML = "";
+  try {
+    if (tab === "customers") renderCustomers(await getJSON(`/api/customers?q=${encodeURIComponent($("q").value)}`));
+    else {
+      const data = await getJSON(`/api/complaints?status=${$("status").value}&q=${encodeURIComponent($("q").value)}`);
+      renderCounts(data.counts); renderComplaints(data.items);
+    }
+  } catch (e) { list.append(el("div", "error", "Could not load: " + e.message)); }
+}
+
+// ---- customers -------------------------------------------------------------
+function renderCustomers(rows) {
+  const list = $("list");
+  if (!rows.length) { list.append(el("div", "empty", "No customers yet. They appear after registering on a call.")); return; }
+  for (const c of rows) {
+    const row = el("div", "row" + (c.id === selected ? " sel" : ""));
+    row.dataset.id = c.id;
+    const city = c.profile && c.profile.city ? " · " + c.profile.city : "";
+    row.append(el("div", "title", c.name),
+               el("div", "meta", c.open_complaints ? `${c.open_complaints} open` : (c.complaints ? `${c.complaints} closed` : "")),
+               el("div", "sub", c.phone + city),
+               el("div", "meta sub", "last call " + day(c.last_call_at)));
+    row.onclick = () => showCustomer(c.id);
+    list.append(row);
+  }
+}
+
+async function showCustomer(id) {
+  selected = id;
+  document.querySelectorAll(".row").forEach(r => r.classList.toggle("sel", +r.dataset.id === id));
+  const d = $("detail"); d.innerHTML = "";
+  let c;
+  try { c = await getJSON(`/api/customers/${id}`); } catch (e) { d.append(el("div", "error", e.message)); return; }
+  d.append(el("h2", null, c.name));
+  d.append(el("div", "sub", `Customer since ${day(c.created_at)} · last call ${when(c.last_call_at)}`));
+
+  d.append(el("h3", null, "Details"));
+  const dl = el("dl");
+  const add = (k, v) => { dl.append(el("dt", null, k), el("dd", null, v || "–")); };
+  add("Phone (caller id)", c.phone);
+  add("Language", c.language);
+  for (const [k, v] of Object.entries(c.profile || {})) add(human(k), String(v));
+  d.append(dl);
+
+  d.append(el("h3", null, `Complaints (${c.complaints.length})`));
+  if (!c.complaints.length) d.append(el("p", "sub", "No complaints."));
+  for (const t of c.complaints) d.append(ticketCard(t, false));
+
+  d.append(el("h3", null, "Recent calls"));
+  if (!c.calls.length) d.append(el("p", "sub", "No calls recorded."));
+  else {
+    const table = el("table", "calls");
+    for (const k of c.calls) {
+      const tr = el("tr");
+      const link = el("a", null, when(k.started_at)); link.href = `/recordings#call-${k.id}`;
+      const td = el("td"); td.append(link);
+      tr.append(td, el("td", "sub", dur(k.duration_s)), el("td", "sub", (k.turns ?? 0) + " turns"),
+                el("td", "sub", k.has_recording ? "🔊 recording" : ""));
+      table.append(tr);
+    }
+    d.append(table);
+  }
+}
+
+// ---- complaints ------------------------------------------------------------
+function renderCounts(counts) {
+  const box = $("counts"); box.innerHTML = "";
+  const total = Object.values(counts).reduce((a, b) => a + b, 0);
+  box.append(el("span", "sub", `${total} total`));
+  for (const s of STATUSES) if (counts[s]) { const p = pill(s); p.textContent = `${LABEL[s]} ${counts[s]}`; box.append(p); }
+}
+
+function renderComplaints(rows) {
+  const list = $("list");
+  if (!rows.length) { list.append(el("div", "empty", "No complaints match.")); return; }
+  for (const t of rows) {
+    const row = el("div", "row" + (t.ticket_no === selected ? " sel" : ""));
+    row.dataset.id = t.ticket_no;
+    const cat = t.details.category ? human(t.details.category) : "Complaint";
+    const head = el("div", "title"); head.append(`#${t.ticket_no} · ${cat} `);
+    if (t.resolution) head.append(el("span", "has-res", "✎ update written"));
+    row.append(head, el("div", "meta"), el("div", "sub", (t.customer_name || "Guest") + " · " + (t.caller_number || "")),
+               el("div", "meta sub", day(t.created_at)));
+    row.children[1].append(pill(t.status));
+    row.onclick = () => showComplaint(t);
+    list.append(row);
+  }
+}
+
+function showComplaint(t) {
+  selected = t.ticket_no;
+  document.querySelectorAll(".row").forEach(r => r.classList.toggle("sel", r.dataset.id === t.ticket_no));
+  const d = $("detail"); d.innerHTML = "";
+  d.append(el("h2", null, `Complaint #${t.ticket_no}`));
+  const who = el("div", "sub");
+  who.append(`${t.customer_name || "Guest"} · ${t.caller_number || "unknown number"} · ${when(t.created_at)} `);
+  if (t.user_id) { const a = el("button", null, "Open customer"); a.onclick = () => { setTab("customers"); setTimeout(() => showCustomer(t.user_id), 200); }; who.append(a); }
+  d.append(who);
+  d.append(el("h3", null, "Ticket"));
+  d.append(ticketCard(t, true));
+}
+
+function ticketCard(t, full) {
+  const card = el("div", "ticket");
+  const head = el("div", "ticket-head");
+  head.append(el("b", null, "#" + t.ticket_no), pill(t.status), el("span", "sub", day(t.created_at)), el("span", "spacer"));
+  const sel = el("select");
+  for (const s of STATUSES) { const o = el("option", null, LABEL[s]); o.value = s; o.selected = s === t.status; sel.append(o); }
+  const note = el("span", "saved");
+  sel.onchange = async () => {
+    note.textContent = "Saving…";
+    try {
+      await getJSON(`/api/complaints/${t.ticket_no}/status`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ status: sel.value }) });
+      t.status = sel.value; note.textContent = "Saved ✓";
+      head.children[1].replaceWith(pill(sel.value));
+      if (tab === "complaints") load();
+    } catch (e) { note.textContent = "Failed: " + e.message; sel.value = t.status; }
+  };
+  head.append(sel, note);
+  card.append(head);
+
+  const dl = el("dl");
+  for (const [k, v] of Object.entries(t.details || {})) {
+    if (k === "description") continue;
+    dl.append(el("dt", null, human(k)), el("dd", null, String(v)));
+  }
+  if (full && t.summary) dl.append(el("dt", null, "Caller said"), el("dd", null, t.summary));
+  if (t.updated_at && t.updated_at !== t.created_at) dl.append(el("dt", null, "Updated"), el("dd", null, when(t.updated_at)));
+  if (dl.children.length) card.append(dl);
+  if (t.details && t.details.description) card.append(el("div", "desc", t.details.description));
+
+  // Resolution / message the bot reads to the customer when they ask about this ticket
+  const res = el("div", "resolution");
+  const lab = el("label", null, "Resolution / message to customer");
+  const ta = el("textarea"); ta.value = t.resolution || ""; ta.maxLength = 1000;
+  ta.placeholder = "e.g. We have refunded the double charge; it will reach your account in 3 to 5 working days.";
+  const bar = el("div", "bar");
+  const hint = el("span", "hint", "The bot reads this out when the customer asks about this complaint. Keep it short and spoken-style.");
+  const save = el("button", null, "Save");
+  const rnote = el("span", "saved");
+  save.onclick = async () => {
+    rnote.textContent = "Saving…";
+    try {
+      await getJSON(`/api/complaints/${t.ticket_no}/resolution`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ resolution: ta.value }) });
+      t.resolution = ta.value.trim(); rnote.textContent = "Saved ✓";
+      if (tab === "complaints") load();
+    } catch (e) { rnote.textContent = "Failed: " + e.message; }
+  };
+  ta.oninput = () => { rnote.textContent = ta.value.trim() !== (t.resolution || "") ? "Unsaved" : ""; };
+  bar.append(hint, rnote, save);
+  res.append(lab, ta, bar);
+  card.append(res);
+  if (t.call_id) { const a = el("a", "sub", "Listen to the call →"); a.href = `/recordings#call-${t.call_id}`; a.style.display = "inline-block"; a.style.marginTop = "6px"; card.append(a); }
+  return card;
+}
+
+document.querySelectorAll(".tab").forEach(b => b.onclick = () => setTab(b.dataset.tab));
+$("q").oninput = () => { clearTimeout(timer); timer = setTimeout(load, 300); };
+$("status").onchange = load;
+$("refresh").onclick = load;
+setTab(location.hash === "#complaints" ? "complaints" : "customers");
+</script>
+</body>
+</html>

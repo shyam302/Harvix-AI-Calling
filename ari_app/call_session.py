@@ -157,6 +157,7 @@ def _drop_likely_silence_hallucination(
     *,
     user_turn_count: int = 0,
     record_duration_s: float | None = None,
+    speech_confirmed: bool = False,
 ) -> str:
     """
     Drop Whisper junk on silence.
@@ -176,8 +177,10 @@ def _drop_likely_silence_hallucination(
         return ""
 
     if key in _EARLY_ONLY_SILENCE_JUNK:
+        # Live VAD already confirmed real speech, so "thank you" / "bye" are meant
+        # (they now end the call politely); only the fallback recording path filters them.
         long_enough = record_duration_s is not None and record_duration_s >= 2.0
-        if user_turn_count >= 1 or long_enough:
+        if speech_confirmed or user_turn_count >= 1 or long_enough:
             return stripped
         log.info(
             "Dropping likely silence/noise transcript %r (first turn, %.1fs)",
@@ -209,7 +212,12 @@ def stasis_channel_peer_info(ch: dict[str, Any]) -> tuple[str | None, str | None
 
 
 # Whisper hint while a PIN is expected: write digits, not words.
-_PIN_STT_PROMPT = "PIN digits: 4 7 0 9. 2 5 8 1."
+# No example numbers here: on silence/echo Whisper would "hear" them (it produced 2 5 8 1).
+_PIN_STT_PROMPT = "The caller is saying a number, digit by digit, or the word skip."
+
+
+class ComplaintCancelled(Exception):
+    """The caller backed out of lodging a complaint ("I don't want to lodge…")."""
 
 
 class CallSession:
@@ -277,6 +285,11 @@ class CallSession:
         # "update on the existing one" vs "a new one".
         self._open_complaints: list[dict] = []
         self._awaiting_complaint_choice = False
+        self._last_heard = ""  # raw text of the last _hear_once() answer
+        self._last_prompt = ""  # last thing the bot said (to recognise its own echo)
+        self._allow_barge = True  # False while fixed question prompts play
+        self._ended_by_bot = False  # bot said goodbye and hung up
+        self._intake_active = False  # inside the complaint flow: "cancel" backs out
         self._rec_channel: str | None = None  # snoop (spy=both) recorded for the whole call
         self._rec_name: str | None = None
         self._rec_started_at = None
@@ -307,7 +320,9 @@ class CallSession:
 
     async def _post(self, path: str, **kwargs: Any) -> httpx.Response:
         r = await self.client.post(f"{self.ari_base}{path}", auth=self.auth, **kwargs)
-        if r.status_code >= 400:
+        if r.status_code == 404 and "/channels/" in path:
+            log.info("ARI POST %s -> 404 (channel gone, caller hung up)", path)
+        elif r.status_code >= 400:
             log.error("ARI POST %s -> %s %s", path, r.status_code, r.text)
         r.raise_for_status()
         return r
@@ -537,13 +552,13 @@ class CallSession:
     def _barge_vad(self) -> live_vad.LiveVad | None:
         """VAD armed to watch for barge-in during bot audio (None when disabled)."""
         vad = self._vad
-        if vad is None or not self.settings.barge_in_enabled:
+        if vad is None or not self.settings.barge_in_enabled or not self._allow_barge:
             return None
         if vad.mode == "off":
             vad.arm("barge")
         return vad if vad.mode == "barge" else None
 
-    async def _capture_turn_vad(self) -> tuple[Path | None, float] | None:
+    async def _capture_turn_vad(self, *, fresh: bool = False) -> tuple[Path | None, float] | None:
         """
         Capture one caller utterance from the live stream.
 
@@ -554,7 +569,10 @@ class CallSession:
         assert vad is not None
         if self._caller_barged_in():
             log.info("[%s] barge-in: caller talking over the bot, listening", self.ctx.session_id)
-        vad.to_listen()
+        if fresh:
+            vad.arm("listen")  # drop anything heard while the bot was talking (echo)
+        else:
+            vad.to_listen()
         try:
             await asyncio.wait_for(
                 vad.ended.wait(), timeout=float(self.settings.record_max_duration_seconds)
@@ -685,7 +703,17 @@ class CallSession:
         vad = self._barge_vad()
         if vad is not None and vad.speech_started.is_set():
             return True
-        r = await self._post(f"{self._channel_path()}/play", json={"media": media})
+        if self._closed:
+            return True
+        try:
+            r = await self._post(f"{self._channel_path()}/play", json={"media": media})
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                # The channel is gone: the caller hung up while the bot was talking.
+                log.info("[%s] caller hung up during playback", self.ctx.session_id)
+                self.mark_channel_dead()
+                return True  # "interrupted": callers stop what they were saying
+            raise
         data = r.json()
         pb_id = data.get("id")
         if not pb_id:
@@ -835,6 +863,12 @@ class CallSession:
                 self.ctx.session_id,
                 self._consecutive_empty_listens,
             )
+            if not self._closed:
+                await self.say_text(
+                    registration.line("silence_goodbye", self._reg_lang()),
+                    record_in_session=False,
+                    trim=False,
+                )
             return True
         if self.settings.prompt_on_silence:
             await self.say_text(conversation.pick_retry_phrase(self.ctx.preferred_lang))
@@ -1497,6 +1531,26 @@ class CallSession:
         is_opening: bool = False,
         trim: bool = True,
     ) -> str:
+        # Fixed prompts (trim=False: questions, readbacks, greetings) are not
+        # interruptible: phone echo of the bot's own voice used to cut them off and
+        # then count as the caller's answer.
+        prev_barge = self._allow_barge
+        self._allow_barge = trim
+        try:
+            return await self._say_text(
+                text, record_in_session=record_in_session, is_opening=is_opening, trim=trim
+            )
+        finally:
+            self._allow_barge = prev_barge
+
+    async def _say_text(
+        self,
+        text: str,
+        *,
+        record_in_session: bool = True,
+        is_opening: bool = False,
+        trim: bool = True,
+    ) -> str:
         full_text = (text or "").strip()
         # trim=False for fixed system prompts (registration), which must be said in full
         spoken = (
@@ -1523,6 +1577,7 @@ class CallSession:
         )
         if not chunks or self._caller_barged_in():
             return ""
+        self._last_prompt = spoken
 
         session_lang = self.ctx.preferred_lang
         voice_en, voice_hi = self._agent_voice_pair()
@@ -1780,47 +1835,74 @@ class CallSession:
             status=self.ctx.user_status,
         )
 
-    async def _hear_once(self, *, stt_prompt: str | None = None) -> str | None:
+    async def _hear_once(
+        self, *, stt_prompt: str | None = None, answers: list[str] | None = None
+    ) -> str | None:
         """
-        One short caller answer as text (for registration questions).
+        One short caller answer as text (for registration / complaint questions).
         Returns "" when nothing usable was said, None when the call is gone.
         The text is NOT added to chat history (it may be a PIN).
+
+        Phone echo: what is heard right after a question is often the end of the
+        bot's own question ("…in a few sentences"). That part is stripped; if
+        nothing else was said, the bot keeps listening instead of asking again.
         """
         await self._prepare_to_listen()
         if self._closed:
             return None
-        wav_path: Path | None = None
-        try:
-            turn = await self._capture_turn_vad() if self._vad is not None else None
-            if self._closed:
-                return None
-            if turn is not None:
-                wav_path = turn[0]
-                if wav_path is None:
-                    return ""
-            else:
-                rec_name = await self.start_recording()
-                if rec_name is None:
+        await asyncio.sleep(0.3)  # let the echo tail of the question die out
+        for _ in range(3):
+            wav_path: Path | None = None
+            try:
+                turn = await self._capture_turn_vad(fresh=True) if self._vad is not None else None
+                if self._closed:
                     return None
-                info = await self.wait_recording()
-                self._clear_recording_wait()
-                name = info.get("name") or ""
-                if info.get("state") == "failed" or not name:
-                    return ""
-                wav_path = await self.fetch_recording_wav(name)
-                await self.delete_stored_recording(name)
-                if wav_path is None:
-                    return ""
-            if stt_prompt:
-                text, *_ = await stt.transcribe_wav(
-                    wav_path, self.settings.whisper_model, initial_prompt=stt_prompt
-                )
-            else:
-                text, *_ = await self._transcribe_turn(wav_path)
-            return (text or "").strip()
-        finally:
-            if wav_path:
-                wav_path.unlink(missing_ok=True)
+                if turn is not None:
+                    wav_path = turn[0]
+                    if wav_path is None:
+                        return ""  # silence until the no-speech timeout
+                else:
+                    rec_name = await self.start_recording()
+                    if rec_name is None:
+                        return None
+                    info = await self.wait_recording()
+                    self._clear_recording_wait()
+                    name = info.get("name") or ""
+                    if info.get("state") == "failed" or not name:
+                        return ""
+                    wav_path = await self.fetch_recording_wav(name)
+                    await self.delete_stored_recording(name)
+                    if wav_path is None:
+                        return ""
+                if stt_prompt:
+                    text, *_ = await stt.transcribe_wav(
+                        wav_path, self.settings.whisper_model, initial_prompt=stt_prompt
+                    )
+                else:
+                    text, *_ = await self._transcribe_turn(wav_path)
+            finally:
+                if wav_path:
+                    wav_path.unlink(missing_ok=True)
+            text = (text or "").strip()
+            answer = registration.strip_echo(text, self._last_prompt, answers)
+            if self._intake_active and answer and registration.wants_cancel(answer):
+                log.info("[%s] caller backed out of the complaint: %r", self.ctx.session_id, answer)
+                raise ComplaintCancelled(answer)
+            # digits masked in logs (PIN / phone numbers); number words too in digit mode
+            shown = re.sub(r"\d", "#", text) if not stt_prompt else f"<{len(text)} chars>"
+            if answer:
+                log.info("[%s] heard: %r", self.ctx.session_id, shown)
+                self._last_heard = answer
+                return answer
+            log.info(
+                "[%s] ignored %r (%s); still listening",
+                self.ctx.session_id,
+                shown,
+                "echo of the question" if text else "no words",
+            )
+            if self._vad is None:
+                return ""
+        return ""
 
     async def _ask(self, prompt: str) -> str | None:
         """Say a prompt (kept out of history) and return the caller's answer."""
@@ -1916,15 +1998,24 @@ class CallSession:
                 prompt = registration.line("digits_again", lang_code, lo=q.min_len, hi=q.max_len)
                 continue
 
-            answer = await self._hear_once()
+            answer = await self._hear_once(answers=q.options)
             if answer is None:
                 return None
             if q.type == "free":
-                if answer and not (not q.required and registration.is_skip(answer) and len(answer.split()) <= 2):
+                short_skip = bool(answer) and registration.is_skip(answer) and len(answer.split()) <= 3
+                if answer and not short_skip:
                     return answer  # the caller's own words
-                if answer:
+                if short_skip and not q.required:
                     return ""
+                if short_skip:  # required: "skip" is not an answer
+                    prompt = registration.line(
+                        "required_answer", lang_code, question=q.prompt(lang_code)
+                    )
+                    continue
                 prompt = registration.line("answer_again", lang_code)
+                continue
+            if answer and q.required and registration.is_skip(answer) and len(answer.split()) <= 3:
+                prompt = registration.line("required_answer", lang_code, question=q.prompt(lang_code))
                 continue
             if answer and not q.required and registration.is_skip(answer) and len(answer.split()) <= 2:
                 return ""  # just "skip" / "no" / "nahi"
@@ -2027,13 +2118,15 @@ class CallSession:
         log.info("[%s] registration: PIN not set; continuing as guest", self.ctx.session_id)
         return registration.line("reg_skipped", lang_code)
 
-    async def _verify_returning_caller(self, user: db.User) -> str | None:
-        """PIN check for a registered caller. None = failed (complaint not taken)."""
+    async def _verify_returning_caller(
+        self, user: db.User, *, first_key: str = "verify_ask", fail_key: str = "verify_failed"
+    ) -> str | None:
+        """PIN check for a registered caller (up to 3 tries). None = failed."""
         lang_code = self._reg_lang()
         n = self.settings.pin_length
-        prompt = registration.line("verify_ask", lang_code, name=user.name, n=n)
+        prompt = registration.line(first_key, lang_code, name=user.name, n=n)
         for attempt in range(3):
-            pin = await self._ask_pin(prompt, attempts=2)
+            pin = await self._ask_pin(prompt, attempts=1)
             if self._closed:
                 return None
             if pin and db.verify_pin(pin, user.pin_hash):
@@ -2041,12 +2134,14 @@ class CallSession:
                 await db.set_call_user(self.ctx.call_db_id, user.id, "verified")
                 log.info("[%s] caller verified user id=%s", self.ctx.session_id, user.id)
                 return registration.line("verified", lang_code, name=user.name)
+            if self._closed:
+                return None
             log.info("[%s] PIN check failed (attempt %s)", self.ctx.session_id, attempt + 1)
             prompt = registration.line("verify_wrong", lang_code)
         self.ctx.user_status = "pin_failed"
         await db.set_call_user(self.ctx.call_db_id, user.id, "pin_failed")
         await self.say_text(
-            registration.line("verify_failed", lang_code), record_in_session=False, trim=False
+            registration.line(fail_key, lang_code), record_in_session=False, trim=False
         )
         return None
 
@@ -2064,13 +2159,28 @@ class CallSession:
             log.info(
                 "[%s] registered caller user id=%s name=%r", self.ctx.session_id, user.id, user.name
             )
+            verified = False
+            if self.settings.verify_pin_on_call:
+                # "Welcome back, Siam! For your security, please say or type your PIN."
+                if await self._verify_returning_caller(
+                    user, first_key="verify_start", fail_key="verify_start_failed"
+                ) is None:
+                    # Wrong PIN (or hung up): no name, no tickets, no account actions.
+                    self.ctx.user_id = None
+                    self.ctx.caller_name = None
+                    self.ctx.open_tickets = []
+                    self._open_complaints = []
+                    return ""  # the failure line already asked "What can I do for you?"
+                verified = True
             complaints = await db.open_complaints(user.id, self.caller_number)
             if complaints:
                 self._open_complaints = complaints
                 self._awaiting_complaint_choice = True
                 self.ctx.open_tickets = [
                     f"{c['ticket_no']} ({c['details'].get('category', 'complaint')}, "
-                    f"{c['status']}, {c['created_at']:%d %b})"
+                    f"status {c['status']}, raised {c['created_at']:%d %b}"
+                    + (f", team's update: {c['resolution'][:200]}" if c.get("resolution") else "")
+                    + ")"
                     for c in complaints
                 ]
                 latest = complaints[0]
@@ -2080,15 +2190,18 @@ class CallSession:
                     len(complaints),
                     latest["ticket_no"],
                 )
+                key = "offer_one" if len(complaints) == 1 else "offer_many"
                 return registration.line(
-                    "offer_one" if len(complaints) == 1 else "offer_many",
+                    key + ("_v" if verified else ""),
                     self._reg_lang(),
                     name=user.name,
                     count=len(complaints),
                     ticket=registration.speak_ticket(latest["ticket_no"]),
                     topic=self._complaint_topic(latest),
                 )
-            return registration.line("welcome_back", self._reg_lang(), name=user.name)
+            return registration.line(
+                "welcome_verified" if verified else "welcome_back", self._reg_lang(), name=user.name
+            )
         return voice_select.opening_greeting_for_call(
             self.settings,
             self.ctx.preferred_lang,
@@ -2100,10 +2213,11 @@ class CallSession:
         return c["details"].get("category") or ("शिकायत" if self._reg_lang() == "hi" else "your issue")
 
     async def _tell_complaint_status(self, user_text: str) -> None:
-        """Read out the open complaints found at call start (max 3)."""
+        """Read out the open complaints (max 3): status, order number, team's resolution."""
         lang_code = self._reg_lang()
         parts = []
-        for c in self._open_complaints[:3]:
+        shown = self._open_complaints[:3]
+        for c in shown:
             status_key = f"status_{c['status']}"
             try:
                 status = registration.line(status_key, lang_code)
@@ -2124,9 +2238,17 @@ class CallSession:
                 parts.append(
                     registration.line("status_order", lang_code, order=registration.speak_ticket(order))
                 )
-        parts.append(registration.line("status_end", lang_code))
+            if c.get("resolution"):
+                parts.append(registration.line("status_resolution", lang_code, text=c["resolution"]))
+        all_done = all(c["status"] == "resolved" for c in shown)
+        parts.append(registration.line("status_end_done" if all_done else "status_end", lang_code))
         line = " ".join(parts)
-        log.info("[%s] told caller the status of %s complaint(s)", self.ctx.session_id, len(self._open_complaints[:3]))
+        log.info(
+            "[%s] told caller the status of %s complaint(s) (%s with a resolution note)",
+            self.ctx.session_id,
+            len(shown),
+            sum(1 for c in shown if c.get("resolution")),
+        )
         await self.say_text(line, record_in_session=False, trim=False)
         self.ctx.add_user(user_text)
         self.ctx.add_assistant(line)
@@ -2137,7 +2259,10 @@ class CallSession:
         Returns True when the turn was handled (status read out / new complaint taken).
         """
         self._awaiting_complaint_choice = False
-        choice = registration.complaint_choice(user_text)
+        intent = registration.complaint_intent(user_text)  # a clear lodge/status sentence wins
+        choice = {"lodge": "new", "status": "existing"}.get(intent) or registration.complaint_choice(
+            user_text
+        )
         log.info("[%s] complaint choice: %s", self.ctx.session_id, choice or "neither")
         if choice == "existing":
             await self._tell_complaint_status(user_text)
@@ -2160,35 +2285,167 @@ class CallSession:
         if not db.available():
             return False
         self._complaint_gate_done = True
-        lang_code = self._reg_lang()
-
-        if self.ctx.user_id is None and self.caller_number and self.settings.registration_enabled:
-            log.info("[%s] complaint from unregistered caller: registering", self.ctx.session_id)
-            closing = await self._register_new_caller()
-            if self._closed:
+        self._intake_active = True
+        try:
+            lang_code = self._reg_lang()
+            if self.ctx.user_status == "pin_failed":
+                # Never re-register this number (it would overwrite the real customer's PIN).
+                await self._say_verify_needed(user_text)
                 return True
-            if closing:
+
+            if self.ctx.user_id is None and self.caller_number and self.settings.registration_enabled:
+                log.info("[%s] complaint from unregistered caller: registering", self.ctx.session_id)
+                closing = await self._register_new_caller()
+                if self._closed:
+                    return True
+                if closing:
+                    await self.say_text(closing, record_in_session=False, trim=False)
+            elif self.ctx.user_id is not None and self.settings.auth_verify_pin and (
+                self.ctx.user_status != "verified"
+            ):
+                user = await db.get_user_by_phone(self.caller_number)
+                closing = await self._verify_returning_caller(user) if user else None
+                if self._closed:
+                    return True
+                if closing is None:
+                    line = registration.line("complaint_no_pin", lang_code)
+                    await self.say_text(line, record_in_session=False, trim=False)
+                    self.ctx.add_user(user_text)
+                    self.ctx.add_assistant(line)
+                    return True
                 await self.say_text(closing, record_in_session=False, trim=False)
-        elif self.ctx.user_id is not None and self.settings.auth_verify_pin and (
-            self.ctx.user_status != "verified"
-        ):
-            user = await db.get_user_by_phone(self.caller_number)
-            closing = await self._verify_returning_caller(user) if user else None
-            if self._closed:
-                return True
-            if closing is None:
-                line = registration.line("complaint_no_pin", lang_code)
-                await self.say_text(line, record_in_session=False, trim=False)
-                self.ctx.add_user(user_text)
-                self.ctx.add_assistant(line)
-                return True
-            await self.say_text(closing, record_in_session=False, trim=False)
 
-        await self._take_complaint(user_text)
-        return True
+            await self._take_complaint(user_text)
+            return True
+        except ComplaintCancelled:
+            line = registration.line("complaint_cancelled", self._reg_lang())
+            await self.say_text(line, record_in_session=False, trim=False)
+            self.ctx.add_user(user_text)
+            self.ctx.add_assistant(line)
+            self._complaint_gate_done = False  # they may still lodge one later in the call
+            return True
+        finally:
+            self._intake_active = False
+
+    async def _maybe_end_call(self, user_text: str) -> str | None:
+        """
+        Caller sounds done ("that's all", "bye", "no" after "anything else?"):
+        ask before hanging up.
+
+        Returns "end"   -> goodbye was said; the caller of this breaks the loop (hangup)
+                "stay"  -> handled ("Sure, what else…"); listen again
+                <text>  -> the caller asked something new instead; process that text
+                None    -> not a closing turn; carry on normally
+        """
+        if not registration.wants_to_end(user_text, self._last_prompt):
+            return None
+        lang_code = self._reg_lang()
+        log.info("[%s] caller sounds done; asking before ending the call", self.ctx.session_id)
+        answer = await self._ask(registration.line("end_ask", lang_code))
+        if answer is None:
+            return "end"  # hung up themselves
+        decision = registration.end_reply(answer)
+        log.info("[%s] end-of-call answer: %s", self.ctx.session_id, decision)
+        self.ctx.add_user(user_text)
+        if decision == "end":
+            name = f", {self.ctx.caller_name}" if self.ctx.user_id and self.ctx.caller_name else ""
+            bye = registration.line("goodbye", lang_code, name=name)
+            self.ctx.add_assistant(bye)
+            await self.say_text(bye, record_in_session=False, trim=False)
+            self._ended_by_bot = True
+            return "end"
+        if decision == "stay":
+            line = registration.line("end_stay", lang_code)
+            self.ctx.add_assistant(line)
+            await self.say_text(line, record_in_session=False, trim=False)
+            return "stay"
+        self.ctx.add_assistant(registration.line("end_ask", lang_code))
+        return answer  # a new request: answer it in this same turn
+
+    async def _say_verify_needed(self, user_text: str) -> None:
+        line = registration.line("verify_needed", self._reg_lang())
+        log.info("[%s] account request refused: PIN not verified", self.ctx.session_id)
+        await self.say_text(line, record_in_session=False, trim=False)
+        self.ctx.add_user(user_text)
+        self.ctx.add_assistant(line)
+
+    async def _answer_complaint_status(self, user_text: str) -> None:
+        """'How many complaints do I have?' / 'status of my complaint' at any point."""
+        self._awaiting_complaint_choice = False
+        if self.ctx.user_status == "pin_failed":
+            await self._say_verify_needed(user_text)
+            return
+        self._open_complaints = await db.open_complaints(self.ctx.user_id, self.caller_number)
+        self.ctx.open_tickets = [
+            f"{c['ticket_no']} ({c['details'].get('category', 'complaint')}, status {c['status']}"
+            + (f", team's update: {c['resolution'][:200]}" if c.get("resolution") else "")
+            + ")"
+            for c in self._open_complaints
+        ]
+        if self._open_complaints:
+            await self._tell_complaint_status(user_text)
+            return
+        key = "no_open_complaints" if self.ctx.user_id is not None else "status_unknown_caller"
+        line = registration.line(key, self._reg_lang())
+        log.info("[%s] status asked: no open complaints", self.ctx.session_id)
+        await self.say_text(line, record_in_session=False, trim=False)
+        self.ctx.add_user(user_text)
+        self.ctx.add_assistant(line)
+
+    def _readback(self, questions: list[registration.Question], details: dict[str, str]) -> str:
+        """Spoken summary of the answers, for confirmation."""
+        lang_code = self._reg_lang()
+        parts = [registration.line("confirm_intro", lang_code)]
+        for q in questions:
+            value = details.get(q.key)
+            if not value:
+                continue
+            if q.type == "free":
+                parts.append(registration.line("confirm_said", lang_code, value=value[:220]))
+            else:
+                spoken = registration.speak_ticket(value) if q.type == "digits" else value
+                label = q.key.replace("_", " ").capitalize()
+                parts.append(registration.line("confirm_field", lang_code, label=label, value=spoken))
+        return " ".join(parts)
+
+    async def _confirm_complaint(
+        self, questions: list[registration.Question], details: dict[str, str]
+    ) -> bool | None:
+        """
+        Read the complaint back and ask yes/no. On "no", re-ask the questions once and
+        confirm again. Returns True (register), False (don't), None (hung up).
+        """
+        lang_code = self._reg_lang()
+        for round_no in range(2):
+            prompt = self._readback(questions, details) + " " + registration.line("confirm_ask", lang_code)
+            answer = None
+            for _ in range(2):
+                heard = await self._ask(prompt)
+                if heard is None:
+                    return None
+                answer = registration.yes_no(heard)
+                if answer:
+                    break
+                prompt = registration.line("confirm_again", lang_code)
+            log.info("[%s] complaint confirmation: %s", self.ctx.session_id, answer or "unclear")
+            if answer == "yes":
+                return True
+            if answer is None or round_no == 1:
+                return False
+            # "no": correct it once by asking the questions again
+            await self.say_text(registration.line("confirm_fix", lang_code), record_in_session=False, trim=False)
+            for q in questions:
+                value = await self._ask_question(q)
+                if value is None:
+                    return None
+                if value:
+                    details[q.key] = value
+                else:
+                    details.pop(q.key, None)
+        return False
 
     async def _take_complaint(self, user_text: str) -> None:
-        """Ask the complaint questions, save the complaint, read out the ticket number."""
+        """Ask the complaint questions, confirm, save, read out the ticket number."""
         lang_code = self._reg_lang()
         questions = registration.load_complaint_questions()
         details: dict[str, str] = {}
@@ -2197,15 +2454,33 @@ class CallSession:
                 registration.line("complaint_start", lang_code), record_in_session=False, trim=False
             )
         for q in questions:
+            self._last_heard = ""
             value = await self._ask_question(q)
             if value is None:
-                break  # hung up: still save what we have
+                return  # hung up before confirming: nothing is registered
+            if registration.complaint_intent(self._last_heard) == "status":
+                # "I already registered one, I want the status" in the middle of the questions
+                log.info("[%s] status question during complaint intake: switching", self.ctx.session_id)
+                await self._answer_complaint_status(self._last_heard)
+                return
             if value:
                 details[q.key] = value
                 shown = value if q.type in ("choice", "text") else f"<{len(value)} chars>"
                 log.info("[%s] complaint: %s = %r", self.ctx.session_id, q.key, shown)
             else:
                 log.info("[%s] complaint: %s skipped", self.ctx.session_id, q.key)
+
+        if questions:
+            confirmed = await self._confirm_complaint(questions, details)
+            if confirmed is None:
+                return  # hung up
+            if not confirmed:
+                line = registration.line("confirm_cancel", lang_code)
+                log.info("[%s] complaint not confirmed: not registered", self.ctx.session_id)
+                await self.say_text(line, record_in_session=False, trim=False)
+                self.ctx.add_user(user_text)
+                self.ctx.add_assistant(line)
+                return
 
         ticket = await db.create_complaint(
             call_id=self.ctx.call_db_id,
@@ -2415,6 +2690,7 @@ class CallSession:
                         user_text,
                         user_turn_count=self.ctx.turn_count,
                         record_duration_s=max(float(duration_sec or 0), wav_dur),
+                        speech_confirmed=vad_turn is not None,
                     )
                     if not user_text:
                         if await self._skip_turn_no_usable_speech(
@@ -2488,10 +2764,30 @@ class CallSession:
                     )
                     grammar = self.ctx.resolved_grammar_gender()
 
+                    # Caller sounds done -> "Shall I end the call now?" -> goodbye + hang up.
+                    ending = await self._maybe_end_call(user_text)
+                    if ending == "end":
+                        break  # finally: teardown + hangup()
+                    if ending == "stay":
+                        continue
+                    if ending:
+                        user_text = ending  # they asked something new instead
+                        log.info("[%s] new request instead of ending: %s", self.ctx.session_id, user_text)
+
                     # Caller with open complaints was asked "update or new?" in the greeting.
                     if self._awaiting_complaint_choice and await self._handle_complaint_choice(
                         user_text
                     ):
+                        if self._closed:
+                            break
+                        continue
+
+                    # "How many complaints do I have?" / "status of my complaint"
+                    if (
+                        db.available()
+                        and registration.complaint_intent(user_text) == "status"
+                    ):
+                        await self._answer_complaint_status(user_text)
                         if self._closed:
                             break
                         continue

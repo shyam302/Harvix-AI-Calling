@@ -117,7 +117,7 @@ def ensure_cuda_library_path() -> list[str]:
 
     _cuda_lib_path_prepended = merged
     _cuda_lib_path_done = True
-    log.info("CUDA library path prepended: %s", merged)
+    log.debug("CUDA library path prepended: %s", merged)
     return merged
 
 
@@ -130,6 +130,9 @@ def build_onnx_providers(*, use_gpu: bool | None = None) -> list[str]:
     """
     ensure_cuda_library_path()
     import onnxruntime as ort
+
+    # Hide routine graph-optimisation warnings ("Memcpy nodes are added…"); errors still show.
+    ort.set_default_logger_severity(3)
 
     if use_gpu is None:
         use_gpu = _bool_env("SUPERTONIC_USE_GPU", True)

@@ -26,6 +26,10 @@ from ari_app.tts import warmup_supertonic
 log = logging.getLogger("ari_callbot")
 
 
+# transformers prints harmless "LOAD REPORT … UNEXPECTED" tables; show errors only.
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+
+
 def _configure_logging() -> None:
     """Uvicorn does not enable our package loggers; mirror `python -m ari_app` so calls print to the terminal."""
     level = getattr(logging, (os.getenv("LOG_LEVEL") or "INFO").upper(), logging.INFO)
@@ -110,11 +114,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     await loop.run_in_executor(None, _warmup_models)
 
-    if not await check_vllm_reachable(
+    if await check_vllm_reachable(
         base_url=settings.vllm_base_url,
         api_key=settings.vllm_api_key,
         connect_timeout_seconds=settings.vllm_connect_timeout_seconds,
     ):
+        log.info("vLLM reachable at %s (model %s)", settings.vllm_base_url, settings.vllm_model)
+    else:
         log.error(
             "vLLM is not reachable at %s — fix network/Tailscale/firewall or VLLM_BASE_URL "
             "before calls can get AI replies.",
@@ -153,7 +159,7 @@ async def health() -> JSONResponse:
 @app.get("/")
 async def root() -> JSONResponse:
     return JSONResponse(
-        {"service": "asterisk-callbot", "health": "/health", "recordings": "/recordings"},
+        {"service": "asterisk-callbot", "health": "/health", "recordings": "/recordings", "customers": "/customers"},
     )
 
 
@@ -194,6 +200,80 @@ async def api_call(call_id: int) -> JSONResponse:
     call["complaints"] = [_jsonable(c) for c in call.get("complaints", [])]
     call.pop("recording_path", None)  # the browser uses /audio, never a disk path
     return JSONResponse(_jsonable(call))
+
+
+# ---- customers + complaints admin page ----
+
+def _db_or_503():
+    from ari_app import db
+
+    if not db.available():
+        raise HTTPException(503, "Database not connected (DATABASE_URL / docker compose up -d postgres)")
+    return db
+
+
+def _deep_jsonable(v):
+    if isinstance(v, dict):
+        return {k: _deep_jsonable(x) for k, x in v.items()}
+    if isinstance(v, list):
+        return [_deep_jsonable(x) for x in v]
+    return v.isoformat() if hasattr(v, "isoformat") else v
+
+
+@app.get("/customers", response_class=HTMLResponse)
+async def customers_page() -> HTMLResponse:
+    return HTMLResponse((_STATIC / "customers.html").read_text(encoding="utf-8"))
+
+
+@app.get("/api/customers")
+async def api_customers(
+    q: str = "", limit: int = Query(100, ge=1, le=500), offset: int = Query(0, ge=0)
+) -> JSONResponse:
+    db = _db_or_503()
+    return JSONResponse(_deep_jsonable(await db.list_customers(search=q, limit=limit, offset=offset)))
+
+
+@app.get("/api/customers/{user_id}")
+async def api_customer(user_id: int) -> JSONResponse:
+    db = _db_or_503()
+    cust = await db.get_customer(user_id)
+    if cust is None:
+        raise HTTPException(404, "No such customer")
+    return JSONResponse(_deep_jsonable(cust))
+
+
+@app.get("/api/complaints")
+async def api_complaints(
+    status: str = "",
+    q: str = "",
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+) -> JSONResponse:
+    db = _db_or_503()
+    rows = await db.list_complaints(status=status, search=q, limit=limit, offset=offset)
+    return JSONResponse({"items": _deep_jsonable(rows), "counts": await db.complaint_counts()})
+
+
+@app.post("/api/complaints/{ticket_no}/status")
+async def api_complaint_status(ticket_no: str, body: dict) -> JSONResponse:
+    db = _db_or_503()
+    status = str(body.get("status", ""))
+    if status not in db.COMPLAINT_STATUSES:
+        raise HTTPException(400, f"status must be one of {', '.join(db.COMPLAINT_STATUSES)}")
+    if not await db.set_complaint_status(ticket_no, status):
+        raise HTTPException(404, "No such ticket")
+    log.info("complaint %s status -> %s (admin page)", ticket_no, status)
+    return JSONResponse({"ticket_no": ticket_no, "status": status})
+
+
+@app.post("/api/complaints/{ticket_no}/resolution")
+async def api_complaint_resolution(ticket_no: str, body: dict) -> JSONResponse:
+    db = _db_or_503()
+    text = str(body.get("resolution", ""))
+    if not await db.set_complaint_resolution(ticket_no, text):
+        raise HTTPException(404, "No such ticket")
+    log.info("complaint %s resolution updated (admin page, %s chars)", ticket_no, len(text.strip()))
+    return JSONResponse({"ticket_no": ticket_no, "resolution": text.strip()[:1000]})
 
 
 @app.get("/api/calls/{call_id}/audio")

@@ -72,6 +72,7 @@ CREATE TABLE IF NOT EXISTS complaints (
 );
 CREATE INDEX IF NOT EXISTS complaints_user_idx ON complaints(user_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS complaints_call_idx ON complaints(call_id);
+ALTER TABLE complaints ADD COLUMN IF NOT EXISTS resolution TEXT;
 ALTER TABLE calls ADD COLUMN IF NOT EXISTS recording_path TEXT;
 ALTER TABLE calls ADD COLUMN IF NOT EXISTS recording_bytes BIGINT;
 """
@@ -467,7 +468,8 @@ async def open_complaints(user_id: int | None, caller_number: str | None, limit:
     async def q(con):
         rows = await con.fetch(
             """
-            SELECT ticket_no, status, summary, details::text AS details, created_at
+            SELECT ticket_no, status, summary, details::text AS details, created_at,
+                   resolution
               FROM complaints
              WHERE status <> 'closed'
                AND (($1::bigint IS NOT NULL AND user_id = $1)
@@ -492,3 +494,151 @@ async def open_complaints(user_id: int | None, caller_number: str | None, limit:
         return out
 
     return await _run("open_complaints", q, default=[])
+
+
+# admin pages (/customers): customers + complaints
+
+COMPLAINT_STATUSES = ("open", "in_progress", "resolved", "closed")
+
+
+def _decode_json(d: dict, *keys: str) -> dict:
+    import json
+
+    for k in keys:
+        v = d.get(k)
+        if isinstance(v, str):
+            try:
+                d[k] = json.loads(v)
+            except ValueError:
+                d[k] = {}
+    return d
+
+
+async def list_customers(*, search: str = "", limit: int = 100, offset: int = 0) -> list[dict]:
+    like = f"%{search.strip()}%" if search.strip() else None
+
+    async def q(con):
+        rows = await con.fetch(
+            """
+            SELECT u.id, u.phone, u.name, u.language, u.profile::text AS profile,
+                   u.created_at, u.last_call_at,
+                   (SELECT count(*) FROM complaints c WHERE c.user_id = u.id) AS complaints,
+                   (SELECT count(*) FROM complaints c
+                     WHERE c.user_id = u.id AND c.status <> 'closed') AS open_complaints,
+                   (SELECT count(*) FROM calls k WHERE k.user_id = u.id) AS calls
+              FROM users u
+             WHERE $3::text IS NULL OR u.name ILIKE $3 OR u.phone ILIKE $3
+                OR u.profile::text ILIKE $3
+             ORDER BY COALESCE(u.last_call_at, u.created_at) DESC
+             LIMIT $1 OFFSET $2
+            """,
+            limit,
+            offset,
+            like,
+        )
+        return [_decode_json(dict(r), "profile") for r in rows]
+
+    return await _run("list_customers", q, default=[])
+
+
+async def get_customer(user_id: int) -> dict | None:
+    async def q(con):
+        row = await con.fetchrow(
+            """
+            SELECT id, phone, name, language, profile::text AS profile,
+                   created_at, updated_at, last_call_at
+              FROM users WHERE id = $1
+            """,
+            user_id,
+        )
+        if row is None:
+            return None
+        out = _decode_json(dict(row), "profile")
+        comps = await con.fetch(
+            """
+            SELECT ticket_no, status, summary, details::text AS details, created_at,
+                   updated_at, call_id, resolution
+              FROM complaints WHERE user_id = $1 ORDER BY created_at DESC
+            """,
+            user_id,
+        )
+        out["complaints"] = [_decode_json(dict(c), "details") for c in comps]
+        calls = await con.fetch(
+            """
+            SELECT id, started_at, duration_s, turns, status,
+                   recording_path IS NOT NULL AS has_recording
+              FROM calls WHERE user_id = $1 ORDER BY started_at DESC LIMIT 20
+            """,
+            user_id,
+        )
+        out["calls"] = [dict(c) for c in calls]
+        return out
+
+    return await _run("get_customer", q)
+
+
+async def list_complaints(
+    *, status: str = "", search: str = "", limit: int = 100, offset: int = 0
+) -> list[dict]:
+    like = f"%{search.strip()}%" if search.strip() else None
+    st = status if status in COMPLAINT_STATUSES else None
+
+    async def q(con):
+        rows = await con.fetch(
+            """
+            SELECT c.ticket_no, c.status, c.summary, c.details::text AS details,
+                   c.created_at, c.updated_at, c.call_id, c.caller_number, c.resolution,
+                   c.user_id, u.name AS customer_name
+              FROM complaints c LEFT JOIN users u ON u.id = c.user_id
+             WHERE ($3::text IS NULL OR c.status = $3)
+               AND ($4::text IS NULL OR c.ticket_no ILIKE $4 OR c.caller_number ILIKE $4
+                    OR u.name ILIKE $4 OR c.details::text ILIKE $4 OR c.summary ILIKE $4)
+             ORDER BY c.created_at DESC
+             LIMIT $1 OFFSET $2
+            """,
+            limit,
+            offset,
+            st,
+            like,
+        )
+        return [_decode_json(dict(r), "details") for r in rows]
+
+    return await _run("list_complaints", q, default=[])
+
+
+async def complaint_counts() -> dict[str, int]:
+    async def q(con):
+        rows = await con.fetch("SELECT status, count(*) AS n FROM complaints GROUP BY status")
+        return {r["status"]: r["n"] for r in rows}
+
+    return await _run("complaint_counts", q, default={})
+
+
+async def set_complaint_status(ticket_no: str, status: str) -> bool:
+    if status not in COMPLAINT_STATUSES:
+        return False
+
+    async def q(con):
+        res = await con.execute(
+            "UPDATE complaints SET status = $2, updated_at = now() WHERE ticket_no = $1",
+            ticket_no,
+            status,
+        )
+        return res.endswith(" 1")
+
+    return bool(await _run("set_complaint_status", q, default=False))
+
+
+async def set_complaint_resolution(ticket_no: str, resolution: str) -> bool:
+    """Message for the customer (read out by the bot when they ask about this ticket)."""
+    text = (resolution or "").strip()[:1000] or None
+
+    async def q(con):
+        res = await con.execute(
+            "UPDATE complaints SET resolution = $2, updated_at = now() WHERE ticket_no = $1",
+            ticket_no,
+            text,
+        )
+        return res.endswith(" 1")
+
+    return bool(await _run("set_complaint_resolution", q, default=False))

@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS complaints (
     summary       TEXT,                           -- what the caller said to start the complaint
     details       JSONB NOT NULL DEFAULT '{}'::jsonb,  -- answers to complaint_questions.json
     status        TEXT NOT NULL DEFAULT 'open',
+    resolution    TEXT,                           -- written on the admin page; read out to the caller
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
