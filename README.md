@@ -212,7 +212,7 @@ complaint_questions.json      questions asked when a caller lodges a complaint
 tts/                  TTS test scripts
 ```
 
-[docs/CALL_FLOW.md](docs/CALL_FLOW.md) walks through one call from dialing to hang-up, naming the function that does each step. [ARCHITECTURE.md](ARCHITECTURE.md) is the older overview.
+[docs/CALL_FLOW.md](docs/CALL_FLOW.md) walks through one call from dialing to hang-up, naming the function that does each step. [ARCHITECTURE.md](ARCHITECTURE.md) is the system overview: components, data model, API and design choices.
 
 ## License
 
