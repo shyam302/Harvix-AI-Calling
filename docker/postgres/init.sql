@@ -53,6 +53,12 @@ CREATE TABLE IF NOT EXISTS complaints (
     updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS phones (
+    extension  TEXT PRIMARY KEY,                  -- SIP login added from the web page
+    note       TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 CREATE INDEX IF NOT EXISTS calls_user_idx ON calls(user_id, started_at DESC);
 CREATE INDEX IF NOT EXISTS calls_caller_idx ON calls(caller_number, started_at DESC);
 CREATE INDEX IF NOT EXISTS call_messages_call_idx ON call_messages(call_id, id);

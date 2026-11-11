@@ -459,3 +459,53 @@ $A 'channel originate Local/7997@from-internal-app/n extension s@test-caller'
 ```
 
 To send keypad digits instead of speech, use `SendDTMF(1234#)` in place of `Playback(…)`. Then follow `logs/callbot.log`. These dialplan additions disappear when the Asterisk container restarts.
+
+---
+
+## Managing customers on the web page
+
+On **http://127.0.0.1:8765/customers** (Customers tab):
+
+| Action | How | Notes |
+|---|---|---|
+| Add a customer | **+ New customer** | Name, phone (the caller id the bot matches, e.g. `1003`), language, a PIN of `PIN_LENGTH` digits (entered twice), and the fields from `registration_questions.json` |
+| Edit | select the customer → **Edit details** | Name, phone, language, profile fields. Clearing a profile field removes it |
+| Change PIN | **Change PIN** | Sets a new PIN without the old one, so it also covers a forgotten PIN. Only the scrypt hash is stored |
+| Delete | **Delete customer** | Their calls, recordings and complaints stay, shown as guest. They can register again on a call |
+
+The phone has to be unique: a second customer with the same caller id is refused.
+
+**Admin login:** set `WEB_ADMIN_PASSWORD` (and optionally `WEB_ADMIN_USER`, default `admin`) in `.env`, then run `docker compose up -d web` (or restart the bot on the host). The browser then asks for it on `/customers`, `/recordings` and all `/api/*` routes. `/health` stays open. With no password set, the pages are open, so keep them on `127.0.0.1`.
+
+**API** (for scripts):
+- `POST /api/customers` `{name, phone, pin, language, profile}`
+- `PATCH /api/customers/{id}`
+- `POST /api/customers/{id}/pin` `{pin}`
+- `DELETE /api/customers/{id}`
+- `GET /api/customer-fields`, which lists the profile fields and the PIN length.
+
+**Customers are not phone accounts.** A customer is someone the bot recognises by caller id; a phone account is a SIP login for Linphone or Zoiper (`PHONES` in `docker/.env`, see [docker/README.md](../docker/README.md#phone-accounts-sip-logins)). For the bot to greet someone calling from extension 1003, create phone account 1003 **and** a customer with phone `1003`.
+
+## Managing phone accounts on the web page
+
+**Phones** tab on http://127.0.0.1:8765/customers:
+
+| Action | Notes |
+|---|---|
+| **+ New phone** | Extension 1000–1999 (the next free one is suggested), password of at least 6 characters (**Generate** makes a 12-character one), an optional note, and optionally a customer (name + PIN) for the same number. The password is shown once |
+| Change password | Only for phones added on the page. The phone has to log in again |
+| Delete phone | Only for phones added on the page. It can no longer log in; calls, recordings and a linked customer stay |
+| Status | Online/offline (registered or not) and "in a call", live from Asterisk |
+
+**How it works** (`ari_app/phones.py`):
+- The page calls ARI dynamic configuration: `PUT/DELETE /ari/asterisk/config/dynamic/res_pjsip/{auth,aor,endpoint}/{ext}`. Asterisk stores these accounts in astdb, on the `asterisk-db` Docker volume, and they work at once.
+- Codecs are copied from the existing phones (`CODECS` in `docker/.env`).
+- The `phones` table in PostgreSQL records which extensions the page created. Phones from `PHONES` in `docker/.env` are read-only on the page (Asterisk also refuses to delete them).
+- **Passwords:** Asterisk keeps phone passwords in clear text, because SIP digest login needs them. They're never logged or stored in PostgreSQL.
+
+**API:**
+- `GET /api/phones`
+- `POST /api/phones` `{extension, password, note, customer: {name, pin}}`
+- `POST /api/phones/{ext}/password` `{password}`
+- `DELETE /api/phones/{ext}`
+

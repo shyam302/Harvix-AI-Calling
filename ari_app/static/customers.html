@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Customers and Complaints</title>
+<title>Customers, Phones and Complaints</title>
 <style>
   :root {
     --bg: #f6f7f9; --card: #fff; --text: #1d2330; --muted: #6b7280;
@@ -78,16 +78,36 @@
   .resolution .bar { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
   .resolution .hint { color: var(--muted); font-size: 12px; flex: 1; }
   .has-res { font-size: 12px; color: var(--accent); margin-left: 6px; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; background: var(--closed); }
+  .dot.online { background: var(--done); }
+  .src { font-size: 11px; color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 0 7px; margin-left: 6px; }
+  .secret { font-family: ui-monospace, monospace; background: var(--bg); padding: 2px 8px; border-radius: 6px; }
+  .actions { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0 2px; }
+  .btn-primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .btn-primary:hover { background: var(--accent); filter: brightness(1.1); }
+  .btn-danger { color: var(--open); border-color: var(--open); }
+  form.panel { border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; margin: 10px 0; display: grid; gap: 10px; }
+  form.panel h4 { margin: 0; font-size: 14px; }
+  form.panel label { display: grid; gap: 4px; font-size: 13px; color: var(--muted); }
+  form.panel input, form.panel select { padding: 7px 10px; border: 1px solid var(--line); border-radius: 8px;
+    background: var(--bg); color: var(--text); font: inherit; font-size: 14px; width: 100%; }
+  form.panel .two { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  @media (max-width: 560px) { form.panel .two { grid-template-columns: 1fr; } }
+  form.panel .bar { display: flex; gap: 8px; align-items: center; }
+  form.panel .msg { font-size: 13px; flex: 1; }
+  form.panel .msg.err { color: var(--open); }
+  form.panel .msg.ok { color: var(--done); }
 </style>
 </head>
 <body>
 <header>
-  <h1>Customers and complaints</h1>
+  <h1>Customers, phones and complaints</h1>
   <nav><a href="/recordings">Call recordings →</a></nav>
 </header>
 <div class="tabs">
   <button class="tab on" data-tab="customers">Customers</button>
   <button class="tab" data-tab="complaints">Complaints</button>
+  <button class="tab" data-tab="phones">Phones</button>
 </div>
 <div class="wrap">
   <div class="card">
@@ -101,6 +121,8 @@
         <option value="closed">Closed</option>
       </select>
       <button id="refresh">Refresh</button>
+      <button id="newCustomer" class="btn-primary">+ New customer</button>
+      <button id="newPhone" class="btn-primary" hidden>+ New phone</button>
     </div>
     <div class="toolbar counts" id="counts" hidden></div>
     <div class="list" id="list"><div class="empty">Loading…</div></div>
@@ -131,9 +153,11 @@ function setTab(t) {
   tab = t; selected = null;
   document.querySelectorAll(".tab").forEach(b => b.classList.toggle("on", b.dataset.tab === t));
   $("status").hidden = t !== "complaints";
+  $("newCustomer").hidden = t !== "customers";
+  $("newPhone").hidden = t !== "phones";
   $("counts").hidden = t !== "complaints";
-  $("q").placeholder = t === "customers" ? "Search name, phone, city…" : "Search ticket, name, phone, description…";
-  $("detail").innerHTML = ""; $("detail").append(el("p", "sub", "Select a " + (t === "customers" ? "customer." : "complaint.")));
+  $("q").placeholder = { customers: "Search name, phone, city…", complaints: "Search ticket, name, phone, description…", phones: "Filter extensions…" }[t];
+  $("detail").innerHTML = ""; $("detail").append(el("p", "sub", "Select a " + { customers: "customer.", complaints: "complaint.", phones: "phone." }[t]));
   load();
 }
 
@@ -142,6 +166,7 @@ async function load() {
   list.innerHTML = "";
   try {
     if (tab === "customers") renderCustomers(await getJSON(`/api/customers?q=${encodeURIComponent($("q").value)}`));
+    else if (tab === "phones") renderPhones(await getJSON("/api/phones"));
     else {
       const data = await getJSON(`/api/complaints?status=${$("status").value}&q=${encodeURIComponent($("q").value)}`);
       renderCounts(data.counts); renderComplaints(data.items);
@@ -174,6 +199,15 @@ async function showCustomer(id) {
   try { c = await getJSON(`/api/customers/${id}`); } catch (e) { d.append(el("div", "error", e.message)); return; }
   d.append(el("h2", null, c.name));
   d.append(el("div", "sub", `Customer since ${day(c.created_at)} · last call ${when(c.last_call_at)}`));
+  const actions = el("div", "actions");
+  const bEdit = el("button", null, "Edit details"), bPin = el("button", null, "Change PIN"),
+        bDel = el("button", "btn-danger", "Delete customer");
+  const formSlot = el("div");
+  bEdit.onclick = () => { formSlot.innerHTML = ""; formSlot.append(customerForm(c)); };
+  bPin.onclick = () => { formSlot.innerHTML = ""; formSlot.append(pinForm(c)); };
+  bDel.onclick = () => deleteCustomer(c);
+  actions.append(bEdit, bPin, bDel);
+  d.append(actions, formSlot);
 
   d.append(el("h3", null, "Details"));
   const dl = el("dl");
@@ -295,11 +329,292 @@ function ticketCard(t, full) {
   return card;
 }
 
+// ---- customer management -----------------------------------------------------
+let FIELDS = null;   // registration questions (profile fields) + PIN length
+async function fields() {
+  if (!FIELDS) FIELDS = await getJSON("/api/customer-fields");
+  return FIELDS;
+}
+const LANGS = [["", "Auto (follow the caller)"], ["en", "English"], ["hi", "Hindi"]];
+
+function input(label, name, value = "", attrs = {}) {
+  const l = el("label", null, label);
+  const i = el("input"); i.name = name; i.value = value ?? "";
+  Object.assign(i, attrs);
+  l.append(i); return l;
+}
+
+function formShell(title) {
+  const f = el("form", "panel");
+  f.append(el("h4", null, title));
+  return f;
+}
+
+function formBar(f, saveText, onCancel) {
+  const bar = el("div", "bar");
+  const msg = el("span", "msg");
+  const save = el("button", "btn-primary", saveText); save.type = "submit";
+  const cancel = el("button", null, "Cancel"); cancel.type = "button"; cancel.onclick = onCancel;
+  bar.append(msg, cancel, save);
+  f.append(bar);
+  return msg;
+}
+
+async function submitJSON(msg, url, method, body) {
+  msg.className = "msg"; msg.textContent = "Saving…";
+  try {
+    const r = await getJSON(url, { method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    msg.className = "msg ok"; msg.textContent = "Saved ✓";
+    return r;
+  } catch (e) { msg.className = "msg err"; msg.textContent = e.message; return null; }
+}
+
+function profileInputs(f, known, profile) {
+  // registration-question fields first, then any other keys already on the customer
+  const keys = [...known.map(q => q.key), ...Object.keys(profile || {}).filter(k => !known.some(q => q.key === k))];
+  if (!keys.length) return;
+  const box = el("div", "two");
+  for (const k of keys) {
+    const q = known.find(x => x.key === k);
+    box.append(input(human(k), "p_" + k, (profile || {})[k] || "", q && q.type === "digits" ? { inputMode: "numeric" } : {}));
+  }
+  f.append(box);
+}
+
+function readProfile(f) {
+  const p = {};
+  for (const i of f.querySelectorAll("input[name^='p_']")) p[i.name.slice(2)] = i.value.trim();
+  return p;
+}
+
+function langSelect(value) {
+  const l = el("label", null, "Language");
+  const s = el("select"); s.name = "language";
+  for (const [v, t] of LANGS) { const o = el("option", null, t); o.value = v; o.selected = (value || "") === v; s.append(o); }
+  l.append(s); return l;
+}
+
+// New customer, or edit details of an existing one (c)
+function customerForm(c) {
+  const isNew = !c;
+  const f = formShell(isNew ? "New customer" : "Edit details");
+  const top = el("div", "two");
+  top.append(input("Name", "name", c?.name || "", { required: true, maxLength: 80 }),
+             input("Phone (caller id, e.g. 1001)", "phone", c?.phone || "", { required: true }));
+  f.append(top);
+  const mid = el("div", "two");
+  mid.append(langSelect(c?.language));
+  f.append(mid);
+  fields().then(F => {
+    if (isNew) {
+      const pins = el("div", "two");
+      const pinAttrs = { required: true, inputMode: "numeric", pattern: `\\d{${F.pin_length}}`, maxLength: F.pin_length, type: "password", autocomplete: "new-password" };
+      pins.append(input(`PIN (${F.pin_length} digits)`, "pin", "", pinAttrs), input("PIN again", "pin2", "", pinAttrs));
+      f.insertBefore(pins, mid.nextSibling);
+    }
+    profileInputs(f, F.fields, c?.profile);
+    const msg = formBar(f, isNew ? "Create customer" : "Save", () => f.remove());
+    f.onsubmit = async ev => {
+      ev.preventDefault();
+      const E = f.elements;
+      const body = { name: E["name"].value.trim(), phone: E["phone"].value.trim(), language: E["language"].value, profile: readProfile(f) };
+      if (isNew) {
+        if (f.elements["pin"].value !== f.elements["pin2"].value) { msg.className = "msg err"; msg.textContent = "The two PINs don't match"; return; }
+        body.pin = f.elements["pin"].value;
+      }
+      const r = await submitJSON(msg, isNew ? "/api/customers" : `/api/customers/${c.id}`, isNew ? "POST" : "PATCH", body);
+      if (r) { await load(); setTimeout(() => showCustomer(isNew ? r.id : c.id), 300); }
+    };
+  }).catch(e => f.append(el("div", "error", e.message)));
+  return f;
+}
+
+function pinForm(c) {
+  const f = formShell(`Change PIN for ${c.name}`);
+  f.append(el("div", "sub", "Sets a new PIN without needing the old one (also for a forgotten PIN). Only a secure hash is stored; tell the customer the new PIN."));
+  fields().then(F => {
+    const attrs = { required: true, inputMode: "numeric", pattern: `\\d{${F.pin_length}}`, maxLength: F.pin_length, type: "password", autocomplete: "new-password" };
+    const two = el("div", "two");
+    two.append(input(`New PIN (${F.pin_length} digits)`, "pin", "", attrs), input("New PIN again", "pin2", "", attrs));
+    f.append(two);
+    const msg = formBar(f, "Set PIN", () => f.remove());
+    f.onsubmit = async ev => {
+      ev.preventDefault();
+      if (f.elements["pin"].value !== f.elements["pin2"].value) { msg.className = "msg err"; msg.textContent = "The two PINs don't match"; return; }
+      if (await submitJSON(msg, `/api/customers/${c.id}/pin`, "POST", { pin: f.elements["pin"].value })) f.reset();
+    };
+  });
+  return f;
+}
+
+async function deleteCustomer(c) {
+  if (!confirm(`Delete ${c.name} (${c.phone})?\n\nTheir past calls, recordings and complaints are kept (shown as guest). They will need to register again.`)) return;
+  try {
+    await getJSON(`/api/customers/${c.id}`, { method: "DELETE" });
+    selected = null;
+    $("detail").innerHTML = ""; $("detail").append(el("p", "sub", `${c.name} was deleted.`));
+    load();
+  } catch (e) { alert("Could not delete: " + e.message); }
+}
+
+// ---- phone accounts (SIP logins) ------------------------------------------------
+let PHONES = null;
+function renderPhones(data) {
+  PHONES = data;
+  const list = $("list"), q = $("q").value.trim();
+  const items = data.items.filter(p => !q || p.extension.includes(q) || (p.customer?.name || "").toLowerCase().includes(q.toLowerCase()));
+  if (!items.length) { list.append(el("div", "empty", "No phones.")); return; }
+  for (const p of items) {
+    const row = el("div", "row" + (p.extension === selected ? " sel" : ""));
+    row.dataset.id = p.extension;
+    const t = el("div", "title"); t.append(el("span", "dot " + (p.state === "online" ? "online" : "")), p.extension);
+    t.append(el("span", "src", p.source === "web" ? "added here" : "from .env"));
+    row.append(t, el("div", "meta", p.in_call ? "in a call" : p.state),
+               el("div", "sub", p.customer ? p.customer.name : "no customer linked"), el("div", "meta sub", p.note || ""));
+    row.onclick = () => showPhone(p);
+    list.append(row);
+  }
+}
+
+function showPhone(p) {
+  selected = p.extension;
+  document.querySelectorAll(".row").forEach(r => r.classList.toggle("sel", r.dataset.id === p.extension));
+  const d = $("detail"); d.innerHTML = "";
+  d.append(el("h2", null, `Phone ${p.extension}`));
+  const dl = el("dl");
+  const add = (k, v) => dl.append(el("dt", null, k), el("dd", null, v || "–"));
+  add("Status", p.in_call ? "online, in a call" : p.state === "online" ? "online (registered)" : "offline (not registered)");
+  add("Comes from", p.source === "web" ? "added on this page" : "PHONES in docker/.env");
+  add("Customer", p.customer ? `${p.customer.name}` : "none (the bot treats this number as a guest)");
+  if (p.note) add("Note", p.note);
+  if (p.created_at) add("Added", when(p.created_at));
+  d.append(dl);
+  d.append(el("h3", null, "Phone settings (Linphone / Zoiper)"));
+  const help = el("dl");
+  help.append(el("dt", null, "Username"), el("dd", null, p.extension),
+              el("dt", null, "Server"), el("dd", null, `${location.hostname === "127.0.0.1" || location.hostname === "localhost" ? "this PC's IP" : location.hostname}, port 5060`),
+              el("dt", null, "Transport"), el("dd", null, "UDP"),
+              el("dt", null, "Call the bot"), el("dd", null, "dial 7001"));
+  d.append(help);
+  const actions = el("div", "actions"), slot = el("div");
+  if (p.source === "web") {
+    const bPw = el("button", null, "Change password"), bDel = el("button", "btn-danger", "Delete phone");
+    bPw.onclick = () => { slot.innerHTML = ""; slot.append(phonePasswordForm(p)); };
+    bDel.onclick = () => deletePhone(p);
+    actions.append(bPw, bDel);
+  } else {
+    actions.append(el("span", "sub", "Defined in docker/.env (PHONES): change or remove it there, then docker compose up -d asterisk."));
+  }
+  if (!p.customer) {
+    const bCust = el("button", null, "Create customer for this number");
+    bCust.onclick = () => { slot.innerHTML = ""; const f = customerForm(null); slot.append(f);
+      setTimeout(() => { const ph = f.elements["phone"]; if (ph) ph.value = p.extension; }, 300); };
+    actions.append(bCust);
+  } else {
+    const bOpen = el("button", null, "Open customer");
+    bOpen.onclick = () => { setTab("customers"); setTimeout(() => showCustomer(p.customer.id), 300); };
+    actions.append(bOpen);
+  }
+  d.append(actions, slot);
+}
+
+function passwordField(label, value) {
+  const l = el("label", null, label);
+  const wrap = el("div", "bar");
+  const i = el("input"); i.name = "password"; i.value = value || ""; i.required = true; i.minLength = 6; i.autocomplete = "new-password";
+  const gen = el("button", null, "Generate"); gen.type = "button";
+  gen.onclick = async () => { const d = await getJSON("/api/phones"); i.value = d.suggested_password; };
+  wrap.append(i, gen); l.append(wrap); return l;
+}
+
+function nextFreeExtension() {
+  const used = new Set((PHONES?.items || []).map(p => +p.extension));
+  for (let n = 1001; n <= 1999; n++) if (!used.has(n)) return String(n);
+  return "";
+}
+
+function newPhoneForm() {
+  const f = formShell("New phone account");
+  f.append(el("div", "sub", "A SIP login for Linphone / Zoiper. It works immediately, with no restart. Extensions 1000–1999."));
+  const two = el("div", "two");
+  two.append(input("Extension", "extension", nextFreeExtension(), { required: true, pattern: "1\\d{3}", maxLength: 4, inputMode: "numeric" }),
+             passwordField("Password (min. 6)", PHONES?.suggested_password));
+  f.append(two, input("Note (optional, e.g. whose phone)", "note", ""));
+  const chk = el("label", null); const cb = el("input"); cb.type = "checkbox"; cb.name = "withCustomer"; cb.style.width = "auto";
+  chk.style.display = "flex"; chk.style.gap = "8px"; chk.style.alignItems = "center";
+  chk.append(cb, "Also create a customer for this number (the bot will greet them by name)");
+  f.append(chk);
+  const cust = el("div", "two"); cust.hidden = true;
+  fields().then(F => {
+    const pin = { inputMode: "numeric", pattern: `\\d{${F.pin_length}}`, maxLength: F.pin_length, type: "password", autocomplete: "new-password" };
+    cust.append(input("Customer name", "cname", ""), input(`Customer PIN (${F.pin_length} digits)`, "cpin", "", pin));
+  });
+  cb.onchange = () => { cust.hidden = !cb.checked; for (const i of cust.querySelectorAll("input")) i.required = cb.checked; };
+  f.append(cust);
+  const msg = formBar(f, "Create phone", () => f.remove());
+  f.onsubmit = async ev => {
+    ev.preventDefault();
+    const E = f.elements;
+    const body = { extension: E["extension"].value.trim(), password: E["password"].value, note: E["note"].value };
+    if (cb.checked) body.customer = { name: E["cname"].value.trim(), pin: E["cpin"].value };
+    const r = await submitJSON(msg, "/api/phones", "POST", body);
+    if (r) {
+      f.innerHTML = "";
+      f.append(el("h4", null, `Phone ${r.extension} created ✓`));
+      const info = el("dl");
+      const pw = el("span", "secret", body.password);
+      info.append(el("dt", null, "Username"), el("dd", null, r.extension), el("dt", null, "Password"), el("dd"));
+      info.lastChild.append(pw);
+      f.append(info, el("div", "sub", "Write the password down now: for security it is not shown again. Enter these in Linphone/Zoiper (UDP, port 5060), then dial 7001."));
+      if (r.customer_error) f.append(el("div", "error", "Customer not created: " + r.customer_error));
+      load();
+    }
+  };
+  return f;
+}
+
+function phonePasswordForm(p) {
+  const f = formShell(`New password for ${p.extension}`);
+  f.append(passwordField("New password (min. 6)", PHONES?.suggested_password));
+  f.append(el("div", "sub", "The phone must log in again with the new password."));
+  const msg = formBar(f, "Set password", () => f.remove());
+  f.onsubmit = async ev => {
+    ev.preventDefault();
+    const pw = f.elements["password"].value;
+    if (await submitJSON(msg, `/api/phones/${p.extension}/password`, "POST", { password: pw })) {
+      msg.textContent = `Saved ✓  New password: ${pw}`;
+    }
+  };
+  return f;
+}
+
+async function deletePhone(p) {
+  if (!confirm(`Delete phone ${p.extension}?\n\nIt can no longer log in. Calls, recordings and any customer with this number are kept.`)) return;
+  try {
+    await getJSON(`/api/phones/${p.extension}`, { method: "DELETE" });
+    selected = null; $("detail").innerHTML = ""; $("detail").append(el("p", "sub", `Phone ${p.extension} was deleted.`));
+    load();
+  } catch (e) { alert("Could not delete: " + e.message); }
+}
+
+$("newPhone").onclick = () => {
+  selected = null;
+  document.querySelectorAll(".row").forEach(r => r.classList.remove("sel"));
+  $("detail").innerHTML = ""; $("detail").append(newPhoneForm());
+};
+
+$("newCustomer").onclick = () => {
+  selected = null;
+  document.querySelectorAll(".row").forEach(r => r.classList.remove("sel"));
+  const d = $("detail"); d.innerHTML = "";
+  d.append(customerForm(null));
+};
+
 document.querySelectorAll(".tab").forEach(b => b.onclick = () => setTab(b.dataset.tab));
 $("q").oninput = () => { clearTimeout(timer); timer = setTimeout(load, 300); };
 $("status").onchange = load;
 $("refresh").onclick = load;
-setTab(location.hash === "#complaints" ? "complaints" : "customers");
+setTab({ "#complaints": "complaints", "#phones": "phones" }[location.hash] || "customers");
 </script>
 </body>
 </html>

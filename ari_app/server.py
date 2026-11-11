@@ -172,6 +172,36 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 app = FastAPI(title="Asterisk Callbot", lifespan=lifespan)
 
 
+# ---- optional admin password for the pages + API ------------------------------------
+# WEB_ADMIN_PASSWORD set -> the browser asks for it (HTTP Basic, user WEB_ADMIN_USER,
+# default "admin"). Unset -> open, as before (keep UVICORN_HOST=127.0.0.1 then).
+# /health stays open for Docker healthchecks.
+
+@app.middleware("http")
+async def _admin_auth(request, call_next):
+    import base64
+    import secrets
+
+    password = os.getenv("WEB_ADMIN_PASSWORD", "")
+    path = request.url.path
+    if not password or path in ("/health", "/"):
+        return await call_next(request)
+    user = os.getenv("WEB_ADMIN_USER", "admin")
+    header = request.headers.get("authorization", "")
+    if header.lower().startswith("basic "):
+        try:
+            got_user, _, got_pw = base64.b64decode(header[6:]).decode().partition(":")
+        except Exception:
+            got_user = got_pw = ""
+        if secrets.compare_digest(got_user, user) and secrets.compare_digest(got_pw, password):
+            return await call_next(request)
+    from fastapi.responses import Response
+
+    return Response(
+        "Login required", status_code=401, headers={"WWW-Authenticate": 'Basic realm="callbot admin"'}
+    )
+
+
 @app.get("/health")
 async def health() -> JSONResponse:
     registry = get_active_call_registry()
@@ -269,6 +299,173 @@ async def api_customer(user_id: int) -> JSONResponse:
     if cust is None:
         raise HTTPException(404, "No such customer")
     return JSONResponse(_deep_jsonable(cust))
+
+
+@app.get("/api/customer-fields")
+async def api_customer_fields() -> JSONResponse:
+    """What the add/edit form shows: registration question keys + PIN length."""
+    from ari_app import registration
+
+    qs = registration.load_questions()
+    return JSONResponse(
+        {
+            "pin_length": load_settings().pin_length,
+            "fields": [{"key": q.key, "label": q.ask.get("en", q.key), "type": q.type} for q in qs],
+        }
+    )
+
+
+def _customer_error(exc: Exception) -> HTTPException:
+    return HTTPException(400, str(exc))
+
+
+@app.post("/api/customers")
+async def api_customer_create(body: dict) -> JSONResponse:
+    db = _db_or_503()
+    try:
+        uid = await db.admin_create_customer(
+            phone=str(body.get("phone", "")),
+            name=str(body.get("name", "")),
+            pin=str(body.get("pin", "")),
+            pin_length=load_settings().pin_length,
+            language=body.get("language") or None,
+            profile=body.get("profile") or {},
+        )
+    except db.CustomerError as exc:
+        raise _customer_error(exc) from exc
+    log.info("customer %s created (admin page)", uid)
+    return JSONResponse({"id": uid})
+
+
+@app.patch("/api/customers/{user_id}")
+async def api_customer_update(user_id: int, body: dict) -> JSONResponse:
+    db = _db_or_503()
+    try:
+        ok = await db.admin_update_customer(
+            user_id,
+            phone=body.get("phone"),
+            name=body.get("name"),
+            language=body.get("language"),
+            profile=body.get("profile"),
+        )
+    except db.CustomerError as exc:
+        raise _customer_error(exc) from exc
+    if not ok:
+        raise HTTPException(404, "No such customer")
+    log.info("customer %s updated (admin page)", user_id)
+    return JSONResponse({"id": user_id})
+
+
+@app.post("/api/customers/{user_id}/pin")
+async def api_customer_pin(user_id: int, body: dict) -> JSONResponse:
+    db = _db_or_503()
+    try:
+        ok = await db.admin_set_pin(user_id, str(body.get("pin", "")), load_settings().pin_length)
+    except db.CustomerError as exc:
+        raise _customer_error(exc) from exc
+    if not ok:
+        raise HTTPException(404, "No such customer")
+    log.info("customer %s PIN changed (admin page)", user_id)  # never the PIN itself
+    return JSONResponse({"id": user_id})
+
+
+@app.delete("/api/customers/{user_id}")
+async def api_customer_delete(user_id: int) -> JSONResponse:
+    db = _db_or_503()
+    if not await db.admin_delete_customer(user_id):
+        raise HTTPException(404, "No such customer")
+    log.info("customer %s deleted (admin page)", user_id)
+    return JSONResponse({"deleted": user_id})
+
+
+# ---- phone accounts (SIP logins) ----
+
+@app.get("/api/phones")
+async def api_phones() -> JSONResponse:
+    from ari_app import phones
+
+    db = _db_or_503()
+    managed = await db.web_phones()
+    try:
+        items = await phones.list_phones(set(managed))
+    except phones.PhoneError as exc:
+        raise HTTPException(503, str(exc)) from exc
+    customers = await db.customers_by_phone([p["extension"] for p in items])
+    for p in items:
+        p["customer"] = customers.get(p["extension"])
+        m = managed.get(p["extension"])
+        p["note"] = m["note"] if m else None
+        p["created_at"] = m["created_at"].isoformat() if m else None
+    return JSONResponse({"items": items, "suggested_password": phones.generate_password()})
+
+
+@app.post("/api/phones")
+async def api_phone_create(body: dict) -> JSONResponse:
+    """New SIP login; optionally also a customer (name + PIN) with that number."""
+    from ari_app import phones
+
+    db = _db_or_503()
+    ext = str(body.get("extension", "")).strip()
+    customer = body.get("customer") or None
+    if customer:  # validate the customer before touching Asterisk
+        try:
+            db._check_pin(str(customer.get("pin", "")), load_settings().pin_length)
+        except db.CustomerError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        if not str(customer.get("name", "")).strip():
+            raise HTTPException(400, "Customer name is required")
+    try:
+        await phones.create_phone(ext, str(body.get("password", "")))
+    except phones.PhoneError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    await db.add_web_phone(ext, (body.get("note") or "").strip() or None)
+    created_customer = None
+    if customer:
+        try:
+            created_customer = await db.admin_create_customer(
+                phone=ext,
+                name=str(customer["name"]),
+                pin=str(customer["pin"]),
+                pin_length=load_settings().pin_length,
+                language=customer.get("language") or None,
+            )
+        except db.CustomerError as exc:
+            return JSONResponse({"extension": ext, "customer_error": str(exc)})
+    return JSONResponse({"extension": ext, "customer_id": created_customer})
+
+
+async def _web_phone_or_403(ext: str):
+    db = _db_or_503()
+    if ext not in await db.web_phones():
+        raise HTTPException(
+            403, f"Phone {ext} comes from PHONES in docker/.env; change it there"
+        )
+    return db
+
+
+@app.post("/api/phones/{ext}/password")
+async def api_phone_password(ext: str, body: dict) -> JSONResponse:
+    from ari_app import phones
+
+    await _web_phone_or_403(ext)
+    try:
+        await phones.set_password(ext, str(body.get("password", "")))
+    except phones.PhoneError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return JSONResponse({"extension": ext})
+
+
+@app.delete("/api/phones/{ext}")
+async def api_phone_delete(ext: str) -> JSONResponse:
+    from ari_app import phones
+
+    db = await _web_phone_or_403(ext)
+    try:
+        await phones.delete_phone(ext)
+    except phones.PhoneError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    await db.remove_web_phone(ext)
+    return JSONResponse({"deleted": ext})
 
 
 @app.get("/api/complaints")

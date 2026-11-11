@@ -190,6 +190,7 @@ If there's **no audio on the phone**, check that `ASTERISK_SOUNDS_EN=/sounds` (b
 | Knowledge documents | `knowledge/` | `bot` |
 | Logs | `logs/callbot.log` | `bot` |
 | PostgreSQL / Redis data | Docker volumes `postgres-data`, `redis-data` | `postgres`, `redis` |
+| Phone accounts added on the web page | Docker volume `asterisk-db` (astdb) | `asterisk` |
 
 Models are **not** baked into the images. They're read from your host caches, so nothing is downloaded twice and the images stay smaller. On a fresh machine, the first start downloads them into those folders.
 

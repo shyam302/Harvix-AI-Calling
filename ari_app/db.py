@@ -73,6 +73,11 @@ CREATE TABLE IF NOT EXISTS complaints (
 CREATE INDEX IF NOT EXISTS complaints_user_idx ON complaints(user_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS complaints_call_idx ON complaints(call_id);
 ALTER TABLE complaints ADD COLUMN IF NOT EXISTS resolution TEXT;
+CREATE TABLE IF NOT EXISTS phones (
+    extension  TEXT PRIMARY KEY,          -- SIP login added from the web page (PJSIP in astdb)
+    note       TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 ALTER TABLE calls ADD COLUMN IF NOT EXISTS recording_path TEXT;
 ALTER TABLE calls ADD COLUMN IF NOT EXISTS recording_bytes BIGINT;
 """
@@ -642,3 +647,157 @@ async def set_complaint_resolution(ticket_no: str, resolution: str) -> bool:
         return res.endswith(" 1")
 
     return bool(await _run("set_complaint_resolution", q, default=False))
+
+
+# ---- customer management (admin page /customers) ------------------------------------
+
+class CustomerError(ValueError):
+    """Validation problem shown to the admin (duplicate phone, bad PIN…)."""
+
+
+def _clean_profile(profile: dict | None) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for k, v in (profile or {}).items():
+        k = str(k).strip().lower().replace(" ", "_")
+        v = "" if v is None else str(v).strip()
+        if k and v:
+            out[k[:40]] = v[:200]
+    return out
+
+
+def _check_pin(pin: str, length: int) -> str:
+    pin = (pin or "").strip()
+    if not pin.isdigit() or len(pin) != length:
+        raise CustomerError(f"PIN must be exactly {length} digits")
+    return pin
+
+
+async def admin_create_customer(
+    *, phone: str, name: str, pin: str, pin_length: int, language: str | None = None,
+    profile: dict | None = None,
+) -> int:
+    """New customer from the admin page. Returns the user id."""
+    import json
+
+    phone, name = (phone or "").strip(), (name or "").strip()
+    if not phone:
+        raise CustomerError("Phone (caller id) is required")
+    if not name:
+        raise CustomerError("Name is required")
+    pin = _check_pin(pin, pin_length)
+    if _pool is None:
+        raise CustomerError("Database not connected")
+    async with _pool.acquire() as con:
+        if await con.fetchval("SELECT 1 FROM users WHERE phone = $1", phone):
+            raise CustomerError(f"A customer with phone {phone} already exists")
+        return await con.fetchval(
+            """
+            INSERT INTO users (phone, name, pin_hash, language, profile)
+            VALUES ($1, $2, $3, $4, $5::jsonb) RETURNING id
+            """,
+            phone,
+            name[:80],
+            hash_pin(pin),
+            (language or "").strip() or None,
+            json.dumps(_clean_profile(profile), ensure_ascii=False),
+        )
+
+
+async def admin_update_customer(
+    user_id: int, *, phone: str | None = None, name: str | None = None,
+    language: str | None = None, profile: dict | None = None,
+) -> bool:
+    """Edit details. ``profile`` replaces the whole profile (keys left empty are removed)."""
+    import json
+
+    if _pool is None:
+        raise CustomerError("Database not connected")
+    async with _pool.acquire() as con:
+        if phone is not None:
+            phone = phone.strip()
+            if not phone:
+                raise CustomerError("Phone (caller id) can't be empty")
+            if await con.fetchval(
+                "SELECT 1 FROM users WHERE phone = $1 AND id <> $2", phone, user_id
+            ):
+                raise CustomerError(f"Another customer already has phone {phone}")
+        if name is not None and not name.strip():
+            raise CustomerError("Name can't be empty")
+        res = await con.execute(
+            """
+            UPDATE users SET
+                phone    = COALESCE($2, phone),
+                name     = COALESCE($3, name),
+                language = CASE WHEN $4::text IS NULL THEN language ELSE NULLIF($4, '') END,
+                profile  = COALESCE($5::jsonb, profile),
+                updated_at = now()
+             WHERE id = $1
+            """,
+            user_id,
+            phone,
+            name.strip()[:80] if name is not None else None,
+            language.strip() if language is not None else None,
+            json.dumps(_clean_profile(profile), ensure_ascii=False) if profile is not None else None,
+        )
+        return res.endswith(" 1")
+
+
+async def admin_set_pin(user_id: int, pin: str, pin_length: int) -> bool:
+    """New PIN (also "forgot PIN"): only the scrypt hash is stored."""
+    pin = _check_pin(pin, pin_length)
+
+    async def q(con):
+        res = await con.execute(
+            "UPDATE users SET pin_hash = $2, updated_at = now() WHERE id = $1",
+            user_id,
+            hash_pin(pin),
+        )
+        return res.endswith(" 1")
+
+    return bool(await _run("admin_set_pin", q, default=False))
+
+
+async def admin_delete_customer(user_id: int) -> bool:
+    """Remove a customer. Their calls/complaints stay (user_id becomes NULL = guest)."""
+
+    async def q(con):
+        res = await con.execute("DELETE FROM users WHERE id = $1", user_id)
+        return res.endswith(" 1")
+
+    return bool(await _run("admin_delete_customer", q, default=False))
+
+
+# ---- phone accounts added from the web page (ari_app/phones.py) -----------------------
+
+async def web_phones() -> dict[str, dict]:
+    async def q(con):
+        rows = await con.fetch("SELECT extension, note, created_at FROM phones")
+        return {r["extension"]: dict(r) for r in rows}
+
+    return await _run("web_phones", q, default={})
+
+
+async def add_web_phone(extension: str, note: str | None = None) -> None:
+    async def q(con):
+        await con.execute(
+            "INSERT INTO phones (extension, note) VALUES ($1, $2) ON CONFLICT (extension) DO NOTHING",
+            extension,
+            note,
+        )
+
+    await _run("add_web_phone", q)
+
+
+async def remove_web_phone(extension: str) -> None:
+    async def q(con):
+        await con.execute("DELETE FROM phones WHERE extension = $1", extension)
+
+    await _run("remove_web_phone", q)
+
+
+async def customers_by_phone(phones: list[str]) -> dict[str, dict]:
+    async def q(con):
+        rows = await con.fetch("SELECT id, phone, name FROM users WHERE phone = ANY($1::text[])", phones)
+        return {r["phone"]: {"id": r["id"], "name": r["name"]} for r in rows}
+
+    return await _run("customers_by_phone", q, default={})

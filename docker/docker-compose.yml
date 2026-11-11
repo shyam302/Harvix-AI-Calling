@@ -51,6 +51,7 @@ services:
       # The bot writes TTS WAVs here (ASTERISK_SOUNDS_EN in project .env); Asterisk plays them.
       - ./data/sounds:/var/lib/asterisk/sounds/en
       - ./data/logs:/var/log/asterisk
+      - asterisk-db:/var/lib/asterisk/db     # astdb: phones added from the web page
 
   # RAG vector store: Redis Stack (RediSearch HNSW index). Bot uses RAG_STORE=redis.
   redis:
@@ -206,7 +207,7 @@ services:
     env_file: ../.env
     environment:
       ARI_ENABLED: "false"
-      UVICORN_HOST: 127.0.0.1
+      UVICORN_HOST: 0.0.0.0
       UVICORN_PORT: "8765"
       LOG_FILE: ""                       # web logs go to "docker logs callbot-web" only
     healthcheck:
@@ -242,5 +243,6 @@ services:
           devices: [{ driver: nvidia, count: all, capabilities: [gpu] }]
 
 volumes:
+  asterisk-db:
   redis-data:
   postgres-data:

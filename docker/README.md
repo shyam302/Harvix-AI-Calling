@@ -24,7 +24,7 @@ docker/
   .env.example         all settings with defaults
   render.sh            fills ${VARS} in asterisk/*.conf from .env at container start
   asterisk/            Asterisk config templates
-    pjsip.conf         phones 1001/1002, SIP port, codecs, Tailscale/NAT IP
+    pjsip.conf         SIP transport, codecs, Tailscale/NAT IP (phone accounts come from PHONES)
     extensions.conf    BOT_EXTENSION (7001) -> Stasis(callbot), 1001 <-> 1002
     http.conf, ari.conf  ARI on 127.0.0.1:8088, user/password (must match ../.env)
     rtp.conf           RTP port range
@@ -65,7 +65,7 @@ docker compose ps                    # stt/tts/embed/gender/bot/web: healthy
 
 **Don't also run `python -m ari_app.server` on the host.** The `bot` container is the bot; two of them would answer the same calls.
 
-**4. Phone:** register Linphone or Zoiper as `1001` with the password from `PHONE_1001_PASSWORD`, using **UDP** to this PC's IP on port 5060. Then dial **7001**.
+**4. Phone:** register Linphone or Zoiper with an account from `PHONES` in `docker/.env` (for example user `1001`, password `1001`), using **UDP** to this PC's IP on port 5060. Then dial **7001**.
 
 **5. Watch:**
 - `docker compose logs -f bot` (the conversation)
@@ -86,6 +86,33 @@ docker exec callbot-asterisk asterisk -rx "pjsip show contacts"   # who is regis
 ```
 
 For changing one container step by step (for example a new TTS model), see [docs/DOCKER.md](../docs/DOCKER.md#changing-a-container-step-by-step-example-tts).
+
+## Phone accounts (SIP logins)
+
+All phones are listed in one line of `docker/.env`, as `extension:password` pairs separated by commas:
+
+```
+PHONES=1001:1001,1002:1002,1003:1003,1004:1004
+```
+
+**To add a phone,** append an entry (for example `,1005:MySecret5`), then:
+
+```bash
+docker compose up -d asterisk      # render.sh regenerates the accounts ("render.sh: 5 phone account(s)")
+docker exec callbot-asterisk asterisk -rx "pjsip show endpoints"   # 1005 is listed
+```
+
+On the new phone, set user `1005`, the password, the server (this PC's IP, port 5060, UDP), and dial **7001** for the bot.
+
+- **Phone to phone:** any extension from 1000 to 1999 can call another directly (1001 dials 1003).
+- **Passwords:** use real passwords for anything reachable from outside your own network.
+
+**Or add phones from the web page:** http://127.0.0.1:8765/customers → **Phones** tab → **+ New phone**. Pick an extension (1000–1999) and a password (or **Generate**), and optionally create a customer for it in the same step. The phone can log in **immediately**, with no restart.
+- **Where they're stored:** Asterisk's database (`astdb`), on the `asterisk-db` volume, so they survive restarts. `docker/asterisk/sorcery.conf` tells PJSIP to read accounts from `pjsip.conf` (`PHONES`) **and** from astdb.
+- **What the page can change:** passwords and deletion of the phones **it** created. Phones from `PHONES` are shown as "from .env" and are changed here, in `docker/.env`.
+- **Live status:** the list shows which phones are online (registered) right now.
+
+These are SIP logins for the phones. The **customers** the bot knows (name, PIN, complaints) are on the same page, in the Customers tab.
 
 ## Bot on the host instead (old way)
 
