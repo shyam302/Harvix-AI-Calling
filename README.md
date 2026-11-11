@@ -67,6 +67,22 @@ cp .env.example .env     # then edit: ARI_PASSWORD, VLLM_BASE_URL, VLLM_MODEL
 
 `python tts/supertonic_demo.py` is a quick way to check that TTS works before you make a call.
 
+### Everything in Docker (branch `dockerize`)
+
+Each function runs in its own container: `stt` (Whisper, GPU), `tts` (Supertonic, GPU), `embed`, `gender`, `bot` (call logic), `web` (pages), plus `asterisk`, `redis` and `postgres`.
+
+```bash
+cd docker && docker compose build && docker compose up -d
+```
+
+Then register a softphone (UDP, port 5060, user `1001`) and dial **7001**. Follow the call with `docker compose logs -f bot`, and play it afterwards at http://127.0.0.1:8765/recordings.
+
+See [docs/DOCKER.md](docs/DOCKER.md) for:
+- the layout and which file to edit for each container;
+- changing one container step by step, for example a new TTS voice, engine or model, rebuilding only `tts`;
+- phone testing and troubleshooting;
+- image sizes and the test results.
+
 ## Configuration
 
 Everything is set in `.env`; [.env.example](.env.example) lists every option with comments. The ones you'll most likely change:

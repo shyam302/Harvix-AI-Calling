@@ -1,0 +1,15 @@
+# Only ari_app/, services/, docker/requirements/ and the question files are copied.
+.git
+.env
+**/.env
+**/__pycache__
+logs/
+recordings/
+knowledge/
+docker/data/
+docs/
+stt_swahili/
+tts/
+*.ogg
+*.wav
+*.wav16

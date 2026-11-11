@@ -1,7 +1,14 @@
-# Asterisk in Docker for the call bot (image: andrius/asterisk).
+# The whole call bot in Docker, one container per function:
+#
+#   asterisk   telephony (SIP/RTP/ARI)          redis      RAG vectors
+#   postgres   users, calls, complaints         stt        Whisper (GPU)
+#   tts        Supertonic + ffmpeg (GPU)        embed      e5 embeddings (CPU)
+#   gender     caller gender model (CPU)        bot        call logic (ARI, VAD, LLM, DB)
+#   web        /recordings + /customers pages   llm        vLLM (optional, --profile llm)
 #
 #   cd docker && cp .env.example .env   # first time; edit values
-#   docker compose up -d
+#   docker compose up -d                 # everything (bot uses the remote vLLM in ../.env)
+#   docker compose up -d asterisk redis postgres   # only infra; run the bot on the host
 #
 # Settings live in docker/.env. The files in asterisk/ are templates: ${VARS}
 # are filled from .env by render.sh each time the container starts.
@@ -9,10 +16,28 @@
 # Host networking: SIP, RTP and ARI appear directly on this machine, and the
 # bot's externalMedia RTP to 127.0.0.1 works.
 # Stop the system Asterisk first (sudo systemctl stop asterisk): both want the same ports.
+# ---- shared settings -----------------------------------------------------------------------
+# Container logs rotate (3 x 10 MB each) so they can never fill the disk.
+x-logging: &logging
+  driver: json-file
+  options: { max-size: "10m", max-file: "3" }
+
+# Model containers: 4 CPU threads each instead of all cores (they must not starve the bot
+# mid-call), fewer glibc malloc arenas (lower RAM), and models loaded from the local cache
+# without contacting HuggingFace at every start (all models are already in ~/.cache).
+x-model-env: &model-env
+  OMP_NUM_THREADS: "4"
+  MKL_NUM_THREADS: "4"
+  TOKENIZERS_PARALLELISM: "false"
+  MALLOC_ARENA_MAX: "2"
+  HF_HUB_OFFLINE: "1"
+  TRANSFORMERS_OFFLINE: "1"
+
 services:
   asterisk:
     image: ${ASTERISK_IMAGE:-andrius/asterisk:22.11.0_debian-trixie}
     container_name: callbot-asterisk
+    logging: *logging
     network_mode: host
     restart: unless-stopped
     env_file: .env
@@ -31,6 +56,7 @@ services:
   redis:
     image: ${REDIS_IMAGE:-redis/redis-stack-server:7.4.0-v3}
     container_name: callbot-redis
+    logging: *logging
     restart: unless-stopped
     ports:
       - "127.0.0.1:${REDIS_PORT:-6379}:6379"
@@ -43,6 +69,7 @@ services:
   postgres:
     image: ${POSTGRES_IMAGE:-postgres:17-alpine}
     container_name: callbot-postgres
+    logging: *logging
     restart: unless-stopped
     ports:
       - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
@@ -58,6 +85,161 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+
+  # ================= AI services (each its own container; built from docker/Dockerfile) =========
+  # Ports are bound to 127.0.0.1 only. Model weights come from your host caches, so nothing
+  # is downloaded again: ~/.cache/huggingface (Whisper, e5, gender) and ~/.cache/supertonic3.
+
+  stt:                                   # speech-to-text: faster-whisper on the GPU
+    build: { context: .., dockerfile: docker/Dockerfile, target: stt }
+    image: harvix/stt:latest
+    container_name: callbot-stt
+    logging: *logging
+    restart: unless-stopped
+    env_file: ../.env
+    environment: *model-env
+    ports: ["127.0.0.1:8101:8101"]
+    volumes:
+      - ${HOME}/.cache/huggingface:/home/app/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices: [{ driver: nvidia, count: all, capabilities: [gpu] }]
+
+  tts:                                   # text-to-speech: Supertonic (GPU) + ffmpeg phone audio
+    build: { context: .., dockerfile: docker/Dockerfile, target: tts }
+    image: harvix/tts:latest
+    container_name: callbot-tts
+    logging: *logging
+    restart: unless-stopped
+    env_file: ../.env
+    environment: *model-env
+    ports: ["127.0.0.1:8102:8102"]
+    volumes:
+      - ${HOME}/.cache/supertonic3:/home/app/.cache/supertonic3
+    deploy:
+      resources:
+        reservations:
+          devices: [{ driver: nvidia, count: all, capabilities: [gpu] }]
+
+  embed:                                 # RAG embeddings: multilingual-e5-small (CPU)
+    build: { context: .., dockerfile: docker/Dockerfile, target: ml }
+    image: harvix/ml:latest
+    container_name: callbot-embed
+    logging: *logging
+    restart: unless-stopped
+    env_file: ../.env
+    environment: *model-env
+    command: ["uvicorn", "embed_service:app", "--host", "0.0.0.0", "--port", "8103"]
+    ports: ["127.0.0.1:8103:8103"]
+    volumes:
+      - ${HOME}/.cache/huggingface:/home/app/.cache/huggingface
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://127.0.0.1:8103/health | grep -q '\"ready\":true'"]
+      interval: 15s
+      timeout: 5s
+      start_period: 120s
+
+  gender:                                # caller gender model (CPU)
+    image: harvix/ml:latest              # same image as embed
+    container_name: callbot-gender
+    logging: *logging
+    restart: unless-stopped
+    env_file: ../.env
+    environment: *model-env
+    command: ["uvicorn", "gender_service:app", "--host", "0.0.0.0", "--port", "8104"]
+    ports: ["127.0.0.1:8104:8104"]
+    volumes:
+      - ${HOME}/.cache/huggingface:/home/app/.cache/huggingface
+    depends_on: [embed]                  # builds harvix/ml first
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://127.0.0.1:8104/health | grep -q '\"ready\":true'"]
+      interval: 15s
+      timeout: 5s
+      start_period: 120s
+
+  # ================= application ================================================================
+
+  bot:                                   # call logic: ARI, live VAD, LLM calls, DB, recordings
+    build: { context: .., dockerfile: docker/Dockerfile, target: app }
+    image: harvix/app:latest
+    container_name: callbot-bot
+    logging: *logging
+    restart: unless-stopped
+    network_mode: host                   # ARI on 127.0.0.1:8088 + VAD RTP to 127.0.0.1:<port>
+    env_file: ../.env                    # same settings as running on the host
+    environment:
+      STT_SERVICE_URL: http://127.0.0.1:8101
+      TTS_SERVICE_URL: http://127.0.0.1:8102
+      EMBED_SERVICE_URL: http://127.0.0.1:8103
+      GENDER_SERVICE_URL: http://127.0.0.1:8104
+      ASTERISK_SOUNDS_EN: /sounds        # shared with asterisk (./data/sounds)
+      UVICORN_HOST: 127.0.0.1
+      UVICORN_PORT: "8766"               # /health only; pages are served by "web"
+      ASTERISK_TERMINAL_OPTS: ""
+      MALLOC_ARENA_MAX: "2"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://127.0.0.1:8766/health | grep -q ok"]
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
+    volumes:
+      - ./data/sounds:/sounds
+      - ../recordings:/app/recordings
+      - ../knowledge:/app/knowledge
+      - ../logs:/app/logs
+    depends_on:
+      asterisk: { condition: service_started }
+      redis: { condition: service_started }
+      postgres: { condition: service_healthy }
+      stt: { condition: service_healthy }
+      tts: { condition: service_healthy }
+      embed: { condition: service_healthy }
+      gender: { condition: service_healthy }
+
+  web:                                   # /recordings + /customers pages (no calls, no models)
+    image: harvix/app:latest             # same image as bot
+    container_name: callbot-web
+    logging: *logging
+    restart: unless-stopped
+    network_mode: host
+    env_file: ../.env
+    environment:
+      ARI_ENABLED: "false"
+      UVICORN_HOST: 127.0.0.1
+      UVICORN_PORT: "8765"
+      LOG_FILE: ""                       # web logs go to "docker logs callbot-web" only
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs -o /dev/null http://127.0.0.1:8765/"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+    volumes:
+      - ../recordings:/app/recordings:ro
+    depends_on:
+      bot: { condition: service_started }     # builds harvix/app first
+      postgres: { condition: service_healthy }
+
+  # ================= optional: local LLM ======================================================
+  # By default the bot uses the remote vLLM in ../.env (VLLM_BASE_URL). To run it here instead:
+  #   docker compose --profile llm up -d llm   and set VLLM_BASE_URL=http://127.0.0.1:8000/v1
+  # Needs GPU memory next to Whisper + Supertonic (8 GB is tight for Gemma E2B; lower
+  # --gpu-memory-utilization or use a smaller model).
+  llm:
+    profiles: ["llm"]
+    image: ${VLLM_IMAGE:-vllm/vllm-openai:latest}
+    container_name: callbot-llm
+    logging: *logging
+    restart: unless-stopped
+    ports: ["127.0.0.1:8000:8000"]
+    ipc: host
+    volumes:
+      - ${HOME}/.cache/huggingface:/root/.cache/huggingface
+    command: ["--model", "${VLLM_MODEL:-google/gemma-4-E2B-it}", "--gpu-memory-utilization", "0.45", "--max-model-len", "4096"]
+    deploy:
+      resources:
+        reservations:
+          devices: [{ driver: nvidia, count: all, capabilities: [gpu] }]
 
 volumes:
   redis-data:

@@ -646,3 +646,35 @@ def end_reply(text: str) -> str:
     if yn == "no" and len(t.split()) <= 4:
         return "stay"
     return "other"
+
+
+# Questions about the caller's OWN data never need a web search (the internet can't
+# know "who changed my name" or "where is my parcel"); the LLM answers from caller info.
+_ABOUT_SELF = re.compile(
+    r"\b(my|mine|me)\b[^.?!]{0,25}\b(name|account|pin|password|complain\w*|ticket|order|"
+    r"number|phone|registration|profile|details|data|refund|payment|parcel|delivery|"
+    r"subscription|plan|bill|balance|status|call)\b|"
+    r"\b(mera|meri|mere|mujhe)\b|मेरा|मेरी|मेरे|मुझे",
+    re.IGNORECASE,
+)
+
+
+def about_caller(text: str) -> bool:
+    return bool(_ABOUT_SELF.search(text or ""))
+
+
+# Questions about THIS business ("what courses do you offer", "your prices", "your
+# opening hours") are answered from the knowledge base / LLM: the web can't know them,
+# and searching only costs ~3 s and returns unrelated pages.
+_ABOUT_BUSINESS = re.compile(
+    r"\b(do|does|can|could|will)\s+(you|u|y'?all)\s+(guys\s+)?"
+    r"(offer|provide|sell|have|teach|do|support|deliver|ship|accept|run)\b|"
+    r"\byour\s+(\w+\s+)?(services?|courses?|products?|plans?|prices?|pricing|fees?|company|"
+    r"office|hours|timings?|policy|policies|team|address|location|branches?|offers?|support)\b|"
+    r"\b(aapke|aapki|aapka)\b|आपके|आपकी|आपका",       # "your" (not plain "aap" = polite "you")
+    re.IGNORECASE,
+)
+
+
+def about_business(text: str) -> bool:
+    return bool(_ABOUT_BUSINESS.search(text or ""))

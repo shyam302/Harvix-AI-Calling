@@ -75,6 +75,17 @@ def _configure_logging() -> None:
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     _configure_logging()
     settings = load_settings()
+
+    if os.getenv("ARI_ENABLED", "true").strip().lower() in ("0", "false", "no", "off"):
+        # Web-only mode (Docker "web" container): pages + API, no models, no calls.
+        from ari_app import db
+
+        log.info("ARI_ENABLED=false: serving web pages only (no call handling)")
+        await db.init(settings.database_url)
+        yield
+        await db.close()
+        return
+
     if not settings.ari_password:
         log.error("Set ARI_PASSWORD in the environment or .env file.")
         raise RuntimeError("ARI_PASSWORD is not set")
@@ -102,6 +113,24 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             log.info("TTS_BACKEND=edge — skipping Supertonic warmup")
         warmup_whisper(model_name=settings.whisper_model)
         warmup_gender_model(enabled=settings.gender_model_enabled)
+        if settings.gender_detect_caller:
+            # First pitch estimate JIT-compiles librosa/numba (~0.3 s): do it now, not on
+            # the first caller turn.
+            import tempfile
+            import wave as _wave
+
+            import numpy as _np
+
+            from ari_app.gender import estimate_pitch_hz
+
+            with tempfile.NamedTemporaryFile(suffix=".wav") as tmp:
+                tone = (0.3 * _np.sin(2 * _np.pi * 150 * _np.arange(8000) / 8000) * 32767).astype("<i2")
+                with _wave.open(tmp.name, "wb") as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)
+                    wf.setframerate(8000)
+                    wf.writeframes(tone.tobytes())
+                estimate_pitch_hz(Path(tmp.name))
         if settings.vad_enabled:
             warmup_vad()
         if settings.rag_enabled:

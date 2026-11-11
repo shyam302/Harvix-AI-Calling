@@ -118,6 +118,11 @@ def warmup_supertonic(
     voice_male: str = "",
 ) -> None:
     """Preload model + voice styles at startup (optional; runs in a thread)."""
+    from ari_app import remote
+
+    if remote.enabled("tts"):
+        remote.wait_ready("tts")  # the tts container loads the model itself
+        return
     engine = _ensure_engine()
     names = {voice_en, voice_hi or voice_en, voice_female, voice_male}
     for name in names:
@@ -492,6 +497,36 @@ async def synthesize_to_wav(
     edge_rate: str | None = None,
 ) -> None:
     """Synthesize with Supertonic or Edge TTS; lang hi/en from text + call session."""
+    from ari_app import remote
+
+    if remote.enabled("tts"):  # Docker: tts container (services/tts_service.py)
+        import base64
+
+        data = await remote.post_json(
+            "tts",
+            "/synthesize",
+            {
+                "text": text,
+                "voice_en": voice_en,
+                "voice_hi": voice_hi,
+                "speed": speed,
+                "speed_en": speed_en,
+                "speed_hi": speed_hi,
+                "silence_duration": silence_duration,
+                "tail_pad_s": tail_pad_s,
+                "session_lang": session_lang,
+                "lang": lang,
+                "voice_name": voice_name,
+                "edge_voice_en": edge_voice_en,
+                "edge_voice_hi": edge_voice_hi,
+                "edge_rate": edge_rate,
+            },
+        )
+        out_wav.write_bytes(base64.b64decode(data["wav"]))
+        if data.get("wav16"):  # 16 kHz twin for G.722 calls
+            wideband_path(out_wav).write_bytes(base64.b64decode(data["wav16"]))
+        return
+
     resolved_lang = lang or pick_supertonic_lang(text, session_lang=session_lang)
     resolved_speed = speed_for_lang(
         resolved_lang,

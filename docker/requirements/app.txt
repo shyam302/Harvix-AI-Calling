@@ -1,0 +1,21 @@
+# bot + web containers: call logic only, no heavy models (those are separate services)
+httpx>=0.27
+websockets>=12.0
+python-dotenv>=1.0
+openai>=1.40
+# Silero VAD (live turn detection) ships inside faster-whisper; runs on CPU via onnxruntime
+faster-whisper==1.2.1
+numpy<2.3
+librosa==0.11.0          # caller pitch estimate
+soundfile>=0.12
+ddgs>=9.0
+duckduckgo-search>=6.0
+beautifulsoup4>=4.12
+langchain-text-splitters>=0.3
+fastapi>=0.115
+uvicorn[standard]>=0.30
+pymupdf>=1.24
+python-docx>=1.1
+rank-bm25>=0.2.2
+redis>=5.0
+asyncpg>=0.29

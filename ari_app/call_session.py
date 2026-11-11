@@ -1194,6 +1194,12 @@ class CallSession:
         """
         if not self.settings.web_search_enabled:
             return None
+        if not force and registration.about_caller(user_text):
+            log.info("[%s] about the caller's own data: no web lookup", self.ctx.session_id)
+            return None
+        if not force and registration.about_business(user_text):
+            log.info("[%s] about this business: no web lookup (knowledge base / LLM)", self.ctx.session_id)
+            return None
         try:
             query = await llm.web_lookup_query(
                 base_url=self.settings.vllm_base_url,
@@ -1219,7 +1225,7 @@ class CallSession:
             ctx_text, web_s = None, 0.0
         else:
             ctx_text, web_s, _ = await self._web_search(
-                query, use_cache_on_failure=False, budget_s=5.0
+                query, use_cache_on_failure=False, budget_s=self.settings.web_lookup_budget_s
             )
             if not ctx_text:
                 self._failed_queries[key] = time.monotonic()

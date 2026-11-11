@@ -1,0 +1,8 @@
+# tts container: Supertonic ONNX on CUDA 12 + ffmpeg (apt). onnxruntime-gpu must be the
+# only onnxruntime installed (the CPU package hides CUDA) - see the Dockerfile.
+supertonic==1.2.3
+fastapi>=0.115
+uvicorn>=0.30
+python-dotenv>=1.0
+httpx>=0.27
+numpy<2.3

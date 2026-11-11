@@ -61,6 +61,10 @@ class RedisKnowledgeBase(KnowledgeBase):
 
     # index management
     def _dim(self) -> int:
+        from ari_app import remote
+
+        if remote.enabled("embed"):
+            return int(self._embed(["dimension probe"], kind="query").shape[1])
         m = self._embedder()
         fn = getattr(m, "get_embedding_dimension", None) or m.get_sentence_embedding_dimension
         return int(fn())

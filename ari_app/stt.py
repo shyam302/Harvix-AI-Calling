@@ -65,6 +65,10 @@ def _whisper_compute_type(device: str) -> str:
 
 def whisper_runtime_info() -> str:
     """Human-readable device/compute for startup logs."""
+    from ari_app import remote
+
+    if remote.enabled("stt"):
+        return f"remote {remote.url('stt')}"
     device = _whisper_device()
     return f"{device}/{_whisper_compute_type(device)}"
 
@@ -103,6 +107,11 @@ def _get_model(model_name: str, device: str, compute_type: str) -> Any:
 
 def warmup_whisper(*, model_name: str) -> None:
     """Preload Whisper weights at startup (avoids multi-second delay on first call)."""
+    from ari_app import remote
+
+    if remote.enabled("stt"):
+        remote.wait_ready("stt")  # the stt container loads the model itself
+        return
     device = _whisper_device()
     compute_type = _whisper_compute_type(device)
     _get_model(model_name, device, compute_type)
@@ -288,6 +297,17 @@ async def transcribe_wav(
     """
     if not wav_path.is_file():
         return "", None, None
+
+    from ari_app import remote
+
+    if remote.enabled("stt"):  # Docker: stt container (services/stt_service.py)
+        data = await remote.post_file(
+            "stt",
+            "/transcribe",
+            wav_path,
+            {"model": whisper_model, "language": language, "initial_prompt": initial_prompt},
+        )
+        return data.get("text", ""), data.get("language"), data.get("probability")
 
     device = _whisper_device()
     compute_type = _whisper_compute_type(device)

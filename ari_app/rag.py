@@ -147,6 +147,13 @@ class KnowledgeBase:
             return self._model
 
     def _embed(self, texts: list[str], *, kind: str) -> np.ndarray:
+        from ari_app import remote
+
+        if remote.enabled("embed"):  # Docker: embed container (services/embed_service.py)
+            vecs = remote.post_json_sync(
+                "embed", "/embed", {"texts": texts, "kind": kind, "model": self.model_name}
+            )["vectors"]
+            return np.asarray(vecs, dtype=np.float32)
         # e5 models expect "query: " / "passage: " prefixes.
         prefixed = [f"{kind}: {t}" for t in texts]
         vecs = self._embedder().encode(
@@ -269,6 +276,12 @@ class KnowledgeBase:
 
     def warmup(self) -> None:
         """Index the folder and load the embedding model before the first call."""
+        from ari_app import remote
+
+        if remote.enabled("embed"):
+            remote.wait_ready("embed")
+            self.refresh()
+            return
         self.refresh()
         self._embedder()
 

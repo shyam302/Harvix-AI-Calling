@@ -59,7 +59,9 @@ flowchart TB
     WEB --> REC
 ```
 
-Everything except vLLM runs on one machine. Asterisk, Redis and PostgreSQL run in Docker; the bot runs on the host because it needs the GPU. Redis and PostgreSQL are optional: without them the bot uses a local RAG index and treats every caller as a guest.
+Everything except vLLM runs on one machine. In the default setup, Asterisk, Redis and PostgreSQL run in Docker and the bot runs on the host with the models in-process.
+
+On the `dockerize` branch every function is its own container instead: `stt` and `tts` on the GPU, `embed` and `gender` on the CPU, a model-free `bot`, and `web`. The bot reaches them over HTTP through `ari_app/remote.py` (`*_SERVICE_URL`). See [docs/DOCKER.md](docs/DOCKER.md). Redis and PostgreSQL are optional: without them the bot uses a local RAG index and treats every caller as a guest.
 
 ## Processes and ports
 

@@ -21,6 +21,10 @@ _load_failed = False
 
 def model_available() -> bool:
     """True if transformers/torch/librosa are installed (model loads lazily)."""
+    from ari_app import remote
+
+    if remote.enabled("gender"):
+        return True
     try:
         import transformers  # noqa: F401
         import torch  # noqa: F401
@@ -74,6 +78,10 @@ def warmup_gender_model(*, enabled: bool = True) -> bool:
     if not enabled:
         log.info("GENDER_MODEL_ENABLED=false — skipping gender model warmup")
         return False
+    from ari_app import remote
+
+    if remote.enabled("gender"):
+        return remote.wait_ready("gender")
     if not model_available():
         log.warning(
             "Gender model warmup skipped: pip install transformers torch librosa"
@@ -103,6 +111,20 @@ def classify_caller_gender(
 
     Returns (gender, p_female, p_male) or None if unsure / error.
     """
+    from ari_app import remote
+
+    if remote.enabled("gender"):  # Docker: gender container (services/gender_service.py)
+        try:
+            data = remote.post_file_sync(
+                "gender", "/classify", wav_path, {"min_confidence": min_confidence}
+            )
+        except Exception as exc:
+            log.warning("Gender service failed for %s: %s", wav_path, exc)
+            return None
+        if not data.get("gender"):
+            return None
+        return data["gender"], float(data["p_female"]), float(data["p_male"])
+
     if not _ensure_model():
         return None
 
