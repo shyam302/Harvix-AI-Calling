@@ -1,0 +1,49 @@
+topic,question,answer,split
+hours,When are you open?,"City Bank is open from 9 am to 5 pm, Monday to Saturday, and closed on Sunday.",train
+loan,I want a home loan.,Home loans start at 8.5 percent a year; press 0 to speak to a loan officer.,train
+loan,Tell me about loans.,Home loans start at 8.5 percent a year; press 0 to speak to a loan officer.,train
+hours,What time do you open?,"City Bank is open from 9 am to 5 pm, Monday to Saturday, and closed on Sunday.",train
+balance,How can I know my balance?,Press 1 and enter your 8-digit account number to hear your balance.,train
+balance,How much is in my account?,Press 1 and enter your 8-digit account number to hear your balance.,train
+block,I can't find my card.,"To block your card, say 'block card' or press 2, and we will block it at once.",train
+block,"Someone took my card, what do I do?","To block your card, say 'block card' or press 2, and we will block it at once.",train
+hours,Till when are you open?,"City Bank is open from 9 am to 5 pm, Monday to Saturday, and closed on Sunday.",train
+agent,I need a real person.,Press 0 at any time and I will connect you to an agent.,train
+branch,Where can I visit you?,"Our main branch is on MG Road, next to the metro station.",train
+branch,Where is the main branch?,"Our main branch is on MG Road, next to the metro station.",train
+branch,How do I reach your office?,"Our main branch is on MG Road, next to the metro station.",train
+hours,Is the bank open on Saturday?,"City Bank is open from 9 am to 5 pm, Monday to Saturday, and closed on Sunday.",train
+branch,Where is City Bank?,"Our main branch is on MG Road, next to the metro station.",train
+block,Please block my credit card.,"To block your card, say 'block card' or press 2, and we will block it at once.",train
+balance,I want my account balance.,Press 1 and enter your 8-digit account number to hear your balance.,train
+agent,Transfer me to customer care.,Press 0 at any time and I will connect you to an agent.,train
+block,Block my ATM card.,"To block your card, say 'block card' or press 2, and we will block it at once.",train
+block,My debit card was stolen.,"To block your card, say 'block card' or press 2, and we will block it at once.",train
+branch,Branch location please.,"Our main branch is on MG Road, next to the metro station.",train
+hours,What are your opening hours?,"City Bank is open from 9 am to 5 pm, Monday to Saturday, and closed on Sunday.",train
+block,How do I block my card?,"To block your card, say 'block card' or press 2, and we will block it at once.",train
+hours,When do you close?,"City Bank is open from 9 am to 5 pm, Monday to Saturday, and closed on Sunday.",train
+loan,Home loan interest rate?,Home loans start at 8.5 percent a year; press 0 to speak to a loan officer.,train
+agent,Let me talk to someone.,Press 0 at any time and I will connect you to an agent.,train
+loan,Can I get a loan?,Home loans start at 8.5 percent a year; press 0 to speak to a loan officer.,train
+balance,How much money do I have?,Press 1 and enter your 8-digit account number to hear your balance.,train
+loan,What interest do you charge on home loans?,Home loans start at 8.5 percent a year; press 0 to speak to a loan officer.,train
+branch,What is your address?,"Our main branch is on MG Road, next to the metro station.",train
+branch,Where is your branch?,"Our main branch is on MG Road, next to the metro station.",train
+hours,What time does City Bank close today?,"City Bank is open from 9 am to 5 pm, Monday to Saturday, and closed on Sunday.",train
+loan,Do you give housing loans?,Home loans start at 8.5 percent a year; press 0 to speak to a loan officer.,train
+balance,Check my account balance.,Press 1 and enter your 8-digit account number to hear your balance.,train
+block,I lost my card.,"To block your card, say 'block card' or press 2, and we will block it at once.",train
+branch,Which branch is nearest?,"Our main branch is on MG Road, next to the metro station.",train
+block,Can you stop my card?,"To block your card, say 'block card' or press 2, and we will block it at once.",train
+loan,How much is the loan interest?,Home loans start at 8.5 percent a year; press 0 to speak to a loan officer.,train
+balance,Balance enquiry please.,Press 1 and enter your 8-digit account number to hear your balance.,train
+agent,Get me an agent please.,Press 0 at any time and I will connect you to an agent.,train
+balance,Tell me my balance.,Press 1 and enter your 8-digit account number to hear your balance.,test
+agent,Connect me to an agent.,Press 0 at any time and I will connect you to an agent.,test
+agent,Human please.,Press 0 at any time and I will connect you to an agent.,test
+loan,What is your home loan rate?,Home loans start at 8.5 percent a year; press 0 to speak to a loan officer.,test
+balance,What is my balance?,Press 1 and enter your 8-digit account number to hear your balance.,test
+hours,Are you open on Sunday?,"City Bank is open from 9 am to 5 pm, Monday to Saturday, and closed on Sunday.",test
+agent,Can I speak to a human?,Press 0 at any time and I will connect you to an agent.,test
+agent,I want to talk to a person.,Press 0 at any time and I will connect you to an agent.,test
