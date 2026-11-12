@@ -1,0 +1,62 @@
+[
+  {
+    "complaint": "I was charged twice for my monthly bill. Please refund the extra amount.",
+    "category": "Billing"
+  },
+  {
+    "complaint": "Late payment fee added even though I paid on time.",
+    "category": "Billing"
+  },
+  {
+    "complaint": "Mujhe galat bill aaya hai, 500 rupaye zyada lag gaye.",
+    "category": "Billing"
+  },
+  {
+    "complaint": "The mobile app crashes every time I try to log in.",
+    "category": "Technical"
+  },
+  {
+    "complaint": "Mera internet kal se band hai, please jaldi theek karo.",
+    "category": "Technical"
+  },
+  {
+    "complaint": "Website is very slow and payments keep failing.",
+    "category": "Technical"
+  },
+  {
+    "complaint": "My order was supposed to arrive 5 days ago and it still has not come.",
+    "category": "Delivery"
+  },
+  {
+    "complaint": "The package arrived damaged and the box was torn.",
+    "category": "Delivery"
+  },
+  {
+    "complaint": "I forgot my password and the reset link is not working.",
+    "category": "Account"
+  },
+  {
+    "complaint": "My KYC is pending for two weeks, account is blocked.",
+    "category": "Account"
+  },
+  {
+    "complaint": "The customer care executive was very rude and hung up on me.",
+    "category": "Staff Behaviour"
+  },
+  {
+    "complaint": "Staff at the store ignored me for 30 minutes.",
+    "category": "Staff Behaviour"
+  },
+  {
+    "complaint": "The product I received is broken and the screen has cracks.",
+    "category": "Product Quality"
+  },
+  {
+    "complaint": "The shirt colour faded after the first wash.",
+    "category": "Product Quality"
+  },
+  {
+    "complaint": "I want to know your office timings.",
+    "category": "Other"
+  }
+]

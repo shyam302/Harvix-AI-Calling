@@ -9,6 +9,9 @@ Usage
     python categorize_complaints.py complaints.xlsx
     python categorize_complaints.py complaints.xlsx --column "Complaint" --out result.xlsx
 
+    # use past complaints as context (saved, so later runs reuse them)
+    python categorize_complaints.py complaints.xlsx --context-file past_complaints.json
+
     # Postgres: read the bot's complaints table and save the category back
     python categorize_complaints.py --from-db
     python categorize_complaints.py --from-db --only-new      # skip already categorized
@@ -53,6 +56,8 @@ in English, Hindi or a mix. Answer only with JSON."""
 
 USER_PROMPT = """Categories:
 {categories}
+
+{context}
 
 Complaint:
 \"\"\"{complaint}\"\"\"
@@ -100,8 +105,11 @@ def _match_category(name: str) -> str:
     return FALLBACK_CATEGORY
 
 
-def categorize(client, model: str, complaint: str) -> tuple[str, str]:
-    """Return (category, reason) for one complaint text."""
+def categorize(client, model: str, complaint: str, context=None) -> tuple[str, str]:
+    """Return (category, reason) for one complaint text.
+
+    context: optional ContextStore (complaint_context.py); similar past
+    complaints are added to the prompt as examples."""
     complaint = (complaint or "").strip()
     if not complaint:
         return FALLBACK_CATEGORY, "empty complaint"
@@ -112,7 +120,11 @@ def categorize(client, model: str, complaint: str) -> tuple[str, str]:
         max_tokens=MAX_TOKENS,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": USER_PROMPT.format(categories=cats, complaint=complaint)},
+            {"role": "user", "content": USER_PROMPT.format(
+                categories=cats,
+                complaint=complaint,
+                context=context.prompt_block(complaint) if context else "",
+            )},
         ],
     )
     text = (resp.choices[0].message.content or "").strip()
@@ -127,7 +139,7 @@ def categorize(client, model: str, complaint: str) -> tuple[str, str]:
 
 
 # ---------------------------------------------------------------- Excel ----
-def run_excel(args, client, model: str) -> None:
+def run_excel(args, client, model: str, context=None) -> None:
     import pandas as pd
 
     src = Path(args.excel)
@@ -140,7 +152,7 @@ def run_excel(args, client, model: str) -> None:
     cats, reasons = [], []
     for i, text in enumerate(df[col].fillna("").astype(str), 1):
         try:
-            cat, why = categorize(client, model, text)
+            cat, why = categorize(client, model, text, context)
         except Exception as exc:  # keep going; mark the row
             cat, why = "ERROR", str(exc)[:200]
         cats.append(cat)
@@ -170,7 +182,7 @@ def _guess_column(df) -> str:
 
 
 # ------------------------------------------------------------- Postgres ----
-def run_db(args, client, model: str) -> None:
+def run_db(args, client, model: str, context=None) -> None:
     """Read the bot's complaints table and store the category back in it."""
     import asyncio
 
@@ -190,7 +202,7 @@ def run_db(args, client, model: str) -> None:
                 if isinstance(details, str):
                     details = json.loads(details or "{}")
                 text = " ".join(filter(None, [r["summary"] or "", *map(str, (details or {}).values())]))
-                cat, _ = categorize(client, model, text)
+                cat, _ = categorize(client, model, text, context)
                 await conn.execute("UPDATE complaints SET category=$1 WHERE id=$2", cat, r["id"])
                 print(f"[{i}/{len(rows)}] {r['ticket_no']}: {cat}")
         finally:
@@ -209,14 +221,27 @@ def main() -> None:
     p.add_argument("--from-db", action="store_true", help="use the Postgres complaints table")
     p.add_argument("--only-new", action="store_true", help="with --from-db: skip categorized rows")
     p.add_argument("--model", help="override VLLM_MODEL")
+    p.add_argument("--no-context", action="store_true", help="don't use past complaints as context")
+    p.add_argument("--context-db", action="store_true", help="read context from Postgres, not the JSON file")
+    p.add_argument("--context-file", help="past complaints (.xlsx/.csv/.json with a category column) "
+                   "to add to the context before categorizing")
     args = p.parse_args()
 
     client = make_client()
     model = args.model or os.getenv("VLLM_MODEL", "google/gemma-4-E2B-it")
+    context = None
+    if not args.no_context:
+        from complaint_context import ContextStore
+
+        context = ContextStore("db" if args.context_db else "file")
+        if args.context_file:  # load/refresh past complaints from a file first
+            added = context.add_from_file(args.context_file)
+            print(f"Loaded {added} new past complaints from {args.context_file}")
+        print(f"Context: {len(context.all())} past complaints")
     if args.from_db:
-        run_db(args, client, model)
+        run_db(args, client, model, context)
     elif args.excel:
-        run_excel(args, client, model)
+        run_excel(args, client, model, context)
     else:
         p.error("give an Excel file or --from-db")
 
