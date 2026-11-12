@@ -10,7 +10,7 @@ import sys
 from collections.abc import AsyncIterator
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 from ari_app.ari_loop import get_active_call_registry, run_ari_forever
@@ -216,10 +216,19 @@ async def health() -> JSONResponse:
 
 
 @app.get("/")
-async def root() -> JSONResponse:
-    return JSONResponse(
-        {"service": "asterisk-callbot", "health": "/health", "recordings": "/recordings", "customers": "/customers"},
-    )
+async def root():
+    """The admin portal (the bot container itself only serves /health and /chat)."""
+    from fastapi.responses import RedirectResponse
+
+    if os.getenv("ARI_ENABLED", "true").strip().lower() in ("0", "false", "no", "off"):
+        return RedirectResponse("/portal")
+    return JSONResponse({"service": "asterisk-callbot", "health": "/health", "chat": "/chat"})
+
+
+@app.get("/portal", response_class=HTMLResponse)
+async def portal_page() -> HTMLResponse:
+    """One page for everything: overview, customers, complaints, phones, calls, assistant."""
+    return HTMLResponse((_STATIC / "portal.html").read_text(encoding="utf-8"))
 
 
 # ---- call recordings page + API (data from PostgreSQL, audio from RECORDINGS_DIR) ----
@@ -229,6 +238,101 @@ _STATIC = Path(__file__).resolve().parent / "static"
 
 def _jsonable(row: dict) -> dict:
     return {k: (v.isoformat() if hasattr(v, "isoformat") else v) for k, v in row.items()}
+
+
+# ---- voice chat in the browser (same conversation engine as phone calls) ----
+
+@app.get("/chat", response_class=HTMLResponse)
+async def chat_page() -> HTMLResponse:
+    return HTMLResponse((_STATIC / "chat.html").read_text(encoding="utf-8"))
+
+
+@app.websocket("/ws/chat")
+async def chat_socket(ws: WebSocket) -> None:
+    """One browser conversation = one WebChatSession (see ari_app/webchat.py)."""
+    import json
+
+    import httpx
+
+    from ari_app.webchat import WebChatSession
+
+    await ws.accept()
+    if os.getenv("ARI_ENABLED", "true").strip().lower() in ("0", "false", "no", "off"):
+        await ws.send_json({"type": "error", "text": "Voice chat runs in the bot (port 8766), not here."})
+        await ws.close()
+        return
+    send_lock = asyncio.Lock()
+
+    async def send(msg) -> None:
+        async with send_lock:  # an audio header and its WAV must stay together
+            if isinstance(msg, (bytes, bytearray)):
+                await ws.send_bytes(bytes(msg))
+            else:
+                await ws.send_json(msg)
+
+    settings = load_settings()
+    phone = (ws.query_params.get("phone") or "").strip()[:20] or None
+    history: list = []
+    # The page first sends {"type":"start","phone":…,"history":[…]} so a conversation
+    # continues after a page switch / refresh (old pages without it: query param only).
+    try:
+        first = await asyncio.wait_for(ws.receive_json(), timeout=3)
+        if first.get("type") == "start":
+            phone = (str(first.get("phone") or "")).strip()[:20] or phone
+            history = first.get("history") or []
+    except Exception:
+        pass
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        session = WebChatSession(settings=settings, send=send, client=client, caller_number=phone)
+        session.resume(history)
+        registry = get_active_call_registry()
+        registry.register(session.ctx)
+        log.info("web chat %s started (phone=%s)", session.ctx.session_id, phone or "-")
+        task = asyncio.create_task(session.run_loop(), name=f"webchat-{session.ctx.session_id}")
+        try:
+            while not task.done():
+                recv = asyncio.create_task(ws.receive())
+                done, _ = await asyncio.wait({recv, task}, return_when=asyncio.FIRST_COMPLETED)
+                if recv not in done:
+                    recv.cancel()
+                    break
+                msg = recv.result()
+                if msg["type"] == "websocket.disconnect":
+                    break
+                if msg.get("bytes"):
+                    session.feed_audio(msg["bytes"])
+                elif msg.get("text"):
+                    try:
+                        data = json.loads(msg["text"])
+                    except ValueError:
+                        continue
+                    kind = data.get("type")
+                    if kind == "text":
+                        session.add_typed(str(data.get("text", "")))
+                    elif kind == "dtmf":
+                        session.on_dtmf(str(data.get("digit", ""))[:1])
+                    elif kind == "voice":
+                        session.set_voice(bool(data.get("on")))
+                    elif kind == "speaker":
+                        session.set_speaker(bool(data.get("on")))
+                    elif kind == "played":
+                        session.audio_played(int(data.get("id", 0)))
+                    elif kind == "hangup":
+                        break
+        except WebSocketDisconnect:
+            pass
+        finally:
+            session.mark_channel_dead()
+            try:
+                await asyncio.wait_for(task, timeout=15)
+            except Exception:
+                task.cancel()
+            registry.unregister(session.channel_id)
+            log.info("web chat %s ended", session.ctx.session_id)
+            try:
+                await ws.close()
+            except Exception:
+                pass
 
 
 @app.get("/recordings", response_class=HTMLResponse)

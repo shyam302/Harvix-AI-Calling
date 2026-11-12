@@ -90,10 +90,40 @@ These are regular expressions. To add a word, add it inside the `( … | … )` 
 | `LLM_TEMPERATURE=0.7` | Lower is more predictable; higher is more varied |
 | `LLM_MAX_TOKENS=160` | A hard cap on reply length |
 | `CALL_PRIMARY_LANG=en` | Language of the greeting |
+| `WEB_SEARCH_PROVIDER=google` + `GOOGLE_CSE_API_KEY` + `GOOGLE_CSE_CX` | Google Programmable Search instead of the free search (`fast`). The Custom Search API must be enabled and allowed for the key in Google Cloud |
+| `GOOGLE_DAILY_LIMIT=100` | Google queries per day (counted in Redis; resets at midnight US Pacific). At the limit, or for 30 min after a Google error (403/429), the free search (DuckDuckGo → Yahoo/Yandex) is used automatically |
 | `VAD_END_SILENCE_MS=700` | How long a pause ends the caller's turn |
 | `VAD_MIN_SPEECH_MS=100` | Shortest sound that counts as an answer (see "Short answers" below) |
 
 ---
+
+### 1f. Who the bot is, and how it treats customers
+
+Set in `.env` (restart with `docker compose up -d bot`):
+
+```
+COMPANY_NAME=Harvix
+AGENT_NAME=Priya
+COMPANY_INFO=We sell … Our hours are … Delivery takes … Refunds …   # one or two sentences
+CALL_TIMEZONE=Asia/Kolkata
+```
+
+- **Greeting:** "Good morning, you've reached Harvix. This is Priya. How can I help you today?" (Hindi: "नमस्ते, Harvix में आपका स्वागत है…").
+- **Every prompt** gets the company and agent name, `COMPANY_INFO`, what the bot can do on a call, and **today's date and time** (`llm._business_and_time()`). Without the date, the LLM used to make one up.
+- **Customer-care rules** (`_PHONE_AGENT_CORE_EN` / `_HI` in `llm.py`):
+  - answer first and briefly;
+  - stay calm with upset callers, without arguing or repeated apologies;
+  - "anything else?" only when the request is done;
+  - **company facts only from `COMPANY_INFO` or `knowledge/`**, never invented.
+- **Company question with no matching document** ("what's your refund policy?"): the bot gets a per-turn instruction not to answer from general knowledge. It says it doesn't have that information and offers to register a request. A "yes" starts the complaint/request flow (`_NO_COMPANY_INFO_NOTE` in `call_session.py`).
+- **Safety net on replies** (`conversation.remove_stalling()`): small models still say "give me a moment while I check…" or "so I can look up the details", which would leave the caller waiting for nothing.
+  - **No facts this turn:** the reply is replaced by "I don't have that information right now, but I can register it as a request…".
+  - **Facts this turn:** only the stalling sentence is removed.
+  - The phrases are `_STALL` in `conversation.py`.
+- **Garbled speech** (Whisper looping on noise: "पर पर पर…"): not answered; the bot asks the caller to repeat (`conversation.is_garbled()`).
+- **Hindi transcribed in Urdu script** is answered in Hindi (`lang.detect_reply_lang()`).
+
+**The best fix for "I don't have that information" is content.** Put your real FAQs, policies, prices and hours in `COMPANY_INFO` (short) or as documents in `knowledge/` (detailed). The bot then answers from them instead of offering a request.
 
 ## 2. Adding questions
 

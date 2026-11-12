@@ -457,6 +457,10 @@ def detect_reply_lang(
     wl = (whisper_lang or "").strip().lower()[:2] or None
     wl = _WHISPER_LANG_ALIASES.get(wl, wl) if wl else None
 
+    if re.search(r"[\u0600-\u06FF]", text or "") and wl in (None, "hi"):
+        # Spoken Hindi that Whisper wrote in Urdu script: reply in Hindi (Devanagari).
+        return "hi"
+
     if text_contains_devanagari(text):
         # Marathi / Nepali also use Devanagari; otherwise Hindi.
         return wl if wl in ("mr", "ne") else "hi"

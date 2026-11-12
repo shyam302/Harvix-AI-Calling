@@ -216,6 +216,18 @@ def stasis_channel_peer_info(ch: dict[str, Any]) -> tuple[str | None, str | None
 _PIN_STT_PROMPT = "The caller is saying a number, digit by digit, or the word skip."
 
 
+# Per-turn instruction when the caller asks about the company and nothing in
+# COMPANY_INFO / knowledge/ matches (works far better than a general prompt rule).
+_NO_COMPANY_INFO_NOTE = (
+    "\nIMPORTANT for this reply: the company information and reference documents contain "
+    "nothing about this question. Unless the answer is in 'About the company' above, do NOT "
+    "answer from general knowledge and do not describe any policy, price, process or "
+    "website. In one or two short sentences, say you don't have that information right now "
+    "and ask if they would like you to register it as a request so the team can get back "
+    "to them."
+)
+
+
 class ComplaintCancelled(Exception):
     """The caller backed out of lodging a complaint ("I don't want to lodge…")."""
 
@@ -290,6 +302,9 @@ class CallSession:
         self._allow_barge = True  # False while fixed question prompts play
         self._ended_by_bot = False  # bot said goodbye and hung up
         self._intake_active = False  # inside the complaint flow: "cancel" backs out
+        # The bot offered "I can register it as a request…"; a "yes" next turn starts the
+        # complaint flow with the caller's original question as its summary.
+        self._offered_request: str | None = None
         self._rec_channel: str | None = None  # snoop (spy=both) recorded for the whole call
         self._rec_name: str | None = None
         self._rec_started_at = None
@@ -795,6 +810,9 @@ class CallSession:
 
         Returns (text, whisper_lang, whisper_lang_probability, pitch_hz).
         """
+        typed = self._take_typed_text()
+        if typed is not None:
+            return typed, None, None, None
         whisper_hint = lang.whisper_language_hint(
             self.ctx.preferred_lang,
             configured=self.settings.whisper_language,
@@ -1197,6 +1215,9 @@ class CallSession:
         if not force and registration.about_caller(user_text):
             log.info("[%s] about the caller's own data: no web lookup", self.ctx.session_id)
             return None
+        if registration.asks_date_time(user_text):
+            log.info("[%s] date/time question: answered from the clock, no web lookup", self.ctx.session_id)
+            return None
         if not force and registration.about_business(user_text):
             log.info("[%s] about this business: no web lookup (knowledge base / LLM)", self.ctx.session_id)
             return None
@@ -1401,6 +1422,8 @@ class CallSession:
         """
         if not self.settings.web_search_enabled:
             return None, 0.0, False
+        if registration.asks_date_time(user_text):
+            return None, 0.0, False  # the prompt has the exact local date/time
 
         cached_topic = (self.ctx.last_web_topic or "").lower()
         new_topic = web_search.detect_search_topic(user_text or "")
@@ -1841,6 +1864,10 @@ class CallSession:
             status=self.ctx.user_status,
         )
 
+    def _take_typed_text(self) -> str | None:
+        """Web chat: a message typed instead of spoken (None on phone calls)."""
+        return None
+
     async def _hear_once(
         self, *, stt_prompt: str | None = None, answers: list[str] | None = None
     ) -> str | None:
@@ -1880,7 +1907,10 @@ class CallSession:
                     await self.delete_stored_recording(name)
                     if wav_path is None:
                         return ""
-                if stt_prompt:
+                typed = self._take_typed_text()
+                if typed is not None:
+                    text = typed
+                elif stt_prompt:
                     text, *_ = await stt.transcribe_wav(
                         wav_path, self.settings.whisper_model, initial_prompt=stt_prompt
                     )
@@ -2269,6 +2299,10 @@ class CallSession:
         choice = {"lodge": "new", "status": "existing"}.get(intent) or registration.complaint_choice(
             user_text
         )
+        if choice is None and registration.yes_no(user_text) == "yes":
+            # "Would you like an update on it, or lodge a new one?" -> "yes" / "haan":
+            # they want the update (the LLM used to ramble about unrelated documents).
+            choice = "existing"
         log.info("[%s] complaint choice: %s", self.ctx.session_id, choice or "neither")
         if choice == "existing":
             await self._tell_complaint_status(user_text)
@@ -2394,6 +2428,8 @@ class CallSession:
         key = "no_open_complaints" if self.ctx.user_id is not None else "status_unknown_caller"
         line = registration.line(key, self._reg_lang())
         log.info("[%s] status asked: no open complaints", self.ctx.session_id)
+        # The line ends "Would you like to lodge one?": a "yes" next turn starts it.
+        self._offered_request = "I want to lodge a complaint"
         await self.say_text(line, record_in_session=False, trim=False)
         self.ctx.add_user(user_text)
         self.ctx.add_assistant(line)
@@ -2706,6 +2742,15 @@ class CallSession:
                         ):
                             break
                         continue
+                    if conversation.is_garbled(user_text):
+                        # Whisper looping on noise ("पर पर पर पर…"): not real speech.
+                        log.info(
+                            "[%s] garbled transcript ignored (%s words); asking to repeat",
+                            self.ctx.session_id,
+                            len(user_text.split()),
+                        )
+                        await self.say_text(conversation.pick_retry_phrase(self.ctx.preferred_lang))
+                        continue
 
                     self._consecutive_empty_listens = 0
 
@@ -2780,6 +2825,16 @@ class CallSession:
                         user_text = ending  # they asked something new instead
                         log.info("[%s] new request instead of ending: %s", self.ctx.session_id, user_text)
 
+                    # "…I can register it as a request. Would you like that?" -> "yes"
+                    if self._offered_request:
+                        offered, self._offered_request = self._offered_request, None
+                        if registration.yes_no(user_text) == "yes":
+                            log.info("[%s] caller accepted the request offer", self.ctx.session_id)
+                            await self._complaint_gate(offered, force=True)
+                            if self._closed:
+                                break
+                            continue
+
                     # Caller with open complaints was asked "update or new?" in the greeting.
                     if self._awaiting_complaint_choice and await self._handle_complaint_choice(
                         user_text
@@ -2807,6 +2862,15 @@ class CallSession:
                     # Own documents first; web only when they have nothing relevant.
                     web_context = await self._knowledge_context(user_text)
                     web_s, web_from_cache = 0.0, False
+                    if web_context is None and registration.about_business(user_text):
+                        # A company question the documents can't answer: the small model
+                        # would invent a policy/price. Tell it, for this turn, not to.
+                        web_context = _NO_COMPANY_INFO_NOTE
+                        self._offered_request = user_text  # a "yes" next turn registers it
+                        log.info(
+                            "[%s] company question with no documents: answering honestly",
+                            self.ctx.session_id,
+                        )
                     if web_context is None:
                         (
                             web_context,
@@ -2847,6 +2911,24 @@ class CallSession:
                         reply = conversation.strip_robotic_phrases(
                             conversation.strip_leading_filler(reply)
                         )
+                        reply, stalled = conversation.remove_stalling(
+                            reply,
+                            has_facts=bool(web_context),
+                            lang="hi" if reply_lang == "hi" else "en",
+                        )
+                        if stalled and not web_context:
+                            self._offered_request = user_text
+                        elif registration.offers_complaint(reply):
+                            # The LLM itself asked "would you like me to register a
+                            # complaint?": a "yes" must start the real flow, not be
+                            # answered by the LLM (it invented a US complaints website).
+                            self._offered_request = user_text
+                        if stalled:
+                            log.info(
+                                "[%s] reply promised a check it can't do; %s",
+                                self.ctx.session_id,
+                                "kept the answer" if web_context else "replaced with honest fallback",
+                            )
                         if reply_lang == "hi":
                             fixed = conversation.align_hindi_bot_grammar(
                                 reply, grammar_gender=grammar

@@ -678,3 +678,35 @@ _ABOUT_BUSINESS = re.compile(
 
 def about_business(text: str) -> bool:
     return bool(_ABOUT_BUSINESS.search(text or ""))
+
+
+# "What's today's date / what time is it / which day": the prompt carries the exact local
+# date and time; a web search returns pages from other time zones (it answered "the 11th"
+# on the 12th). Never search these.
+_DATE_TIME = re.compile(
+    r"\b(today'?s (?:date|day)|(?:date|day|time) (?:is it )?(?:today|now|right now)|"
+    r"what(?:'s| is)? (?:the )?(?:date|day|time)(?: is it)? ?(?:today|now|right now)?\s*\??$|"
+    r"what (?:time|day) is it|current (?:date|time|day)|which day is (?:it|today)|"
+    r"aaj (?:kya|kaun si|konsi|kaunsa) (?:tarikh|tareekh|date|din)|kitne baje|abhi kya time)\b|"
+    r"आज (?:क्या|कौन सी|कौनसी) (?:तारीख|तारिख)|कितने बजे|अभी क्या समय|आज कौन सा दिन|आज क्या दिन",
+    re.IGNORECASE,
+)
+
+
+def asks_date_time(text: str) -> bool:
+    return bool(_DATE_TIME.search(text or ""))
+
+
+# A bot reply that ends by offering to take a complaint / request ("Would you like to
+# lodge one?", "Shall I register it as a complaint?"); a "yes" then starts the flow.
+_OFFER = re.compile(
+    r"(would you like|do you want|shall i|should i|can i|may i|want me to)[^.?!]{0,50}"
+    r"(lodge|register|file|raise|log|record|create|take)[^.?!]{0,30}(complaint|request|ticket)|"
+    r"(would you like|do you want|shall i|should i|want me to)[^.?!]{0,30}(lodge|file|register|raise) (one|it|this|that)\b|"
+    r"(शिकायत|अनुरोध)[^।?]{0,40}(दर्ज)[^।?]{0,30}\?",
+    re.IGNORECASE,
+)
+
+
+def offers_complaint(reply: str) -> bool:
+    return bool(_OFFER.search(reply or ""))

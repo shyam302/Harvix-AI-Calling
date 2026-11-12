@@ -128,6 +128,21 @@ class LiveVad(asyncio.DatagramProtocol):
             self._total += len(pcm)
         self._feed(pcm.astype(np.float32) / 32768.0)
 
+    def feed_pcm(self, pcm: np.ndarray) -> None:
+        """
+        Plain 16 kHz int16 audio (web chat: browser microphone over a WebSocket), the
+        same path as an RTP packet minus the header. Lets one VAD serve both.
+        """
+        self.packets += 1
+        self._last_packet = time.monotonic()
+        if self.mode == "off" or self.ended.is_set() or len(pcm) == 0:
+            return
+        self.packets_armed += 1
+        if self._total < _MAX_BUFFER_S * SAMPLE_RATE:
+            self._chunks.append(pcm)
+            self._total += len(pcm)
+        self._feed(pcm.astype(np.float32) / 32768.0)
+
     # --- turn control --------------------------------------------------------------
     @property
     def port(self) -> int | None:

@@ -616,5 +616,67 @@ $("status").onchange = load;
 $("refresh").onclick = load;
 setTab({ "#complaints": "complaints", "#phones": "phones" }[location.hash] || "customers");
 </script>
+
+<!-- ===== side chat panel: the voice/text assistant (served by the bot on port 8766) ===== -->
+<style>
+  #chatFab { position: fixed; right: 20px; bottom: 20px; z-index: 50; border: none; border-radius: 999px;
+    padding: 12px 18px; background: var(--accent); color: #fff; font: 600 15px system-ui, sans-serif;
+    box-shadow: 0 4px 14px rgba(0,0,0,.18); cursor: pointer; }
+  #chatPanel { position: fixed; top: 0; right: 0; height: 100vh; height: 100dvh; width: min(440px, 100vw); z-index: 60;
+    background: var(--card); border-left: 1px solid var(--line); box-shadow: -6px 0 24px rgba(0,0,0,.12);
+    transform: translateX(100%); transition: transform .2s ease; display: flex; flex-direction: column; }
+  #chatPanel.open { transform: none; }
+  #chatPanel .bar { display: flex; align-items: center; justify-content: space-between; padding: 8px 12px; border-bottom: 1px solid var(--line); }
+  #chatPanel .bar b { font-size: 14px; }
+  #chatPanel .bar button { border: 1px solid var(--line); background: transparent; color: var(--text); border-radius: 8px; padding: 4px 10px; cursor: pointer; }
+  #chatPanel iframe { flex: 1; border: 0; width: 100%; background: var(--bg); }
+</style>
+<button id="chatFab" title="Chat with the assistant">💬 Chat</button>
+<aside id="chatPanel" aria-label="Assistant chat">
+  <div class="bar"><b>Assistant</b><button id="chatClose" title="Close (the chat keeps going)">✕</button></div>
+</aside>
+<script>
+(() => {
+  const panel = document.getElementById("chatPanel"), fab = document.getElementById("chatFab");
+  let frame = null;
+  fab.onclick = () => {
+    if (!frame) {   // load once; closing only hides it, so the conversation continues
+      frame = document.createElement("iframe");
+      frame.src = `${location.protocol}//${location.hostname}:8766/chat?embed=1`;
+      frame.allow = "microphone; autoplay";
+      panel.append(frame);
+    }
+    panel.classList.add("open"); fab.hidden = true;
+  };
+  document.getElementById("chatClose").onclick = () => { panel.classList.remove("open"); fab.hidden = false; };
+})();
+</script>
+
+<!-- ===== embedded in the portal (/portal): the portal provides title, menu and chat ===== -->
+<style>
+  .embed body > header, .embed .tabs, .embed #chatFab, .embed #chatPanel { display: none !important; }
+  .embed header + .wrap, .embed .wrap { padding-top: 16px; }
+</style>
+<script>
+(() => {
+  const embedded = new URLSearchParams(location.search).has("embed") && window.parent !== window;
+  if (!embedded) return;
+  document.documentElement.classList.add("embed");
+  // "/recordings#call-12" links open the Recordings section of the portal instead
+  document.addEventListener("click", e => {
+    const a = e.target.closest && e.target.closest('a[href*="/recordings#call-"]');
+    if (!a || !window.parent.portalGo) return;
+    e.preventDefault();
+    window.parent.portalGo("recordings", a.getAttribute("href").split("#")[1]);
+  }, true);
+})();
+</script>
+<script>
+// portal menu switches tabs through the URL hash
+window.addEventListener("hashchange", () => {
+  const t = { "#complaints": "complaints", "#phones": "phones", "#customers": "customers" }[location.hash];
+  if (t && t !== tab) setTab(t);
+});
+</script>
 </body>
 </html>

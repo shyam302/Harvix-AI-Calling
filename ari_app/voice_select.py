@@ -46,8 +46,27 @@ def _time_of_day_bucket() -> str:
     return "evening"
 
 
+def _company_opening(lang: str) -> str | None:
+    """With COMPANY_NAME / AGENT_NAME set, introduce the company (callers know where they are)."""
+    import os
+
+    company = (os.getenv("COMPANY_NAME") or "").strip()
+    agent = (os.getenv("AGENT_NAME") or "").strip()
+    if not company:
+        return None
+    greet = {"morning": "Good morning", "afternoon": "Good afternoon", "evening": "Good evening"}[
+        _time_of_day_bucket()
+    ]
+    if lang == "hi":
+        return f"नमस्ते, {company} में आपका स्वागत है।" + (f" मैं {agent} बोल रही हूँ।" if agent else "") + " बताइए, मैं आपकी क्या मदद कर सकती हूँ?"
+    return f"{greet}, you've reached {company}." + (f" This is {agent}." if agent else "") + " How can I help you today?"
+
+
 def _dynamic_opening_en(*, caller_name: str | None) -> str:
     name = (caller_name or "").strip()
+    company_line = _company_opening("en")
+    if company_line and not (name and name not in ("-", "unknown")):
+        return company_line
     if name and name not in ("-", "unknown"):
         return random.choice(
             (

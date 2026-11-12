@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Call Bot Portal</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #fff; --text: #1d2330; --muted: #6b7280; --line: #e5e7eb;
+    --side: #0f172a; --side-text: #cbd5e1; --side-active: #1e293b;
+    --accent: #0f766e; --accent-soft: #e6f4f2;
+    --open: #b45309; --open-soft: #fef3c7; --prog: #1d4ed8; --prog-soft: #dbeafe;
+    --done: #15803d; --done-soft: #dcfce7; --closed: #6b7280; --closed-soft: #f3f4f6;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #111418; --card: #1a1f26; --text: #e6e8eb; --muted: #9aa3ad; --line: #2a313b;
+      --side: #0b0f14; --side-active: #1a2230; --accent: #2dd4bf; --accent-soft: #12302d;
+      --open: #fbbf24; --open-soft: #3a2a0a; --prog: #93c5fd; --prog-soft: #172554;
+      --done: #86efac; --done-soft: #0f2e1a; --closed: #9aa3ad; --closed-soft: #232a33;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body { margin: 0; font: 15px/1.5 system-ui, sans-serif; background: var(--bg); color: var(--text);
+         display: grid; grid-template-columns: 220px minmax(0, 1fr); height: 100vh; height: 100dvh; overflow: hidden; }
+
+  /* sidebar */
+  nav { background: var(--side); color: var(--side-text); display: flex; flex-direction: column; padding: 16px 10px; gap: 2px; }
+  .brand { color: #fff; font-weight: 700; font-size: 17px; padding: 4px 10px 16px; }
+  .brand small { display: block; font-weight: 400; font-size: 12px; color: var(--side-text); opacity: .8; }
+  nav a { color: var(--side-text); text-decoration: none; padding: 9px 12px; border-radius: 8px; display: flex; gap: 10px; align-items: center; }
+  nav a:hover { background: var(--side-active); color: #fff; }
+  nav a.on { background: var(--side-active); color: #fff; font-weight: 600; box-shadow: inset 3px 0 0 var(--accent); }
+  nav .ico { width: 18px; text-align: center; }
+  nav .spacer { flex: 1; }
+  nav .foot { font-size: 12px; opacity: .7; padding: 8px 12px; }
+
+  /* main */
+  .main { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+  .topbar { display: flex; align-items: center; gap: 12px; padding: 12px 20px; border-bottom: 1px solid var(--line); background: var(--card); }
+  .topbar h1 { font-size: 18px; margin: 0; flex: 1; }
+  .topbar button { border: 1px solid var(--line); background: transparent; color: var(--text); border-radius: 999px; padding: 7px 14px; font: inherit; cursor: pointer; }
+  .topbar button.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+  #menuBtn { display: none; }
+  .view { flex: 1; min-height: 0; display: none; }
+  .view.on { display: block; }
+  .view iframe { width: 100%; height: 100%; border: 0; display: block; }
+  #overview { overflow-y: auto; padding: 20px; }
+
+  /* overview */
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin-bottom: 18px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; }
+  a.card { color: inherit; text-decoration: none; }
+  a.card:hover { border-color: var(--accent); }
+  .card .k { color: var(--muted); font-size: 13px; }
+  .card .v { font-size: 28px; font-weight: 700; font-variant-numeric: tabular-nums; line-height: 1.2; margin-top: 2px; }
+  .card .s { font-size: 12px; color: var(--muted); margin-top: 4px; }
+  .pills { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+  .pill { font-size: 12px; padding: 1px 9px; border-radius: 999px; font-weight: 600; }
+  .s-open { color: var(--open); background: var(--open-soft); } .s-in_progress { color: var(--prog); background: var(--prog-soft); }
+  .s-resolved { color: var(--done); background: var(--done-soft); } .s-closed { color: var(--closed); background: var(--closed-soft); }
+  .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  @media (max-width: 1000px) { .cols { grid-template-columns: 1fr; } }
+  .list h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 0 0 8px; }
+  .item { display: grid; grid-template-columns: 1fr auto; gap: 2px 10px; padding: 9px 0; border-top: 1px solid var(--line); cursor: pointer; }
+  .item:first-of-type { border-top: 0; }
+  .item:hover .t { color: var(--accent); }
+  .t { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .m { color: var(--muted); font-size: 13px; }
+  .r { text-align: right; white-space: nowrap; }
+  .empty { color: var(--muted); padding: 10px 0; }
+  .error { color: var(--open); }
+
+  @media (max-width: 860px) {
+    body { grid-template-columns: minmax(0, 1fr); }
+    nav { position: fixed; inset: 0 auto 0 0; width: 230px; z-index: 30; transform: translateX(-100%); transition: transform .2s; }
+    nav.open { transform: none; }
+    #menuBtn { display: inline-block; }
+  }
+</style>
+</head>
+<body>
+<nav id="nav">
+  <div class="brand" id="brand">Call Bot<small>Admin portal</small></div>
+  <a href="#overview" data-view="overview"><span class="ico">◧</span>Overview</a>
+  <a href="#customers" data-view="customers"><span class="ico">👤</span>Customers</a>
+  <a href="#complaints" data-view="complaints"><span class="ico">🎫</span>Complaints</a>
+  <a href="#phones" data-view="phones"><span class="ico">☎</span>Phones</a>
+  <a href="#recordings" data-view="recordings"><span class="ico">🔊</span>Calls &amp; recordings</a>
+  <div class="spacer"></div>
+  <div class="foot">Phone line: dial 7001</div>
+</nav>
+
+<div class="main">
+  <div class="topbar">
+    <button id="menuBtn" aria-label="Menu">☰</button>
+    <h1 id="title">Overview</h1>
+    <button id="refresh" title="Reload this section">↻ Refresh</button>
+  </div>
+  <section class="view" id="overview"></section>
+  <section class="view" id="v-customers"></section>
+  <section class="view" id="v-complaints"></section>
+  <section class="view" id="v-phones"></section>
+  <section class="view" id="v-recordings"></section>
+</div>
+
+
+<script>
+const $ = id => document.getElementById(id);
+const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
+const TITLES = { overview: "Overview", customers: "Customers", complaints: "Complaints", phones: "Phones", recordings: "Calls & recordings" };
+const PAGES = {   // existing pages, embedded (each kept loaded once opened)
+  customers: "/customers?embed=1#customers", complaints: "/customers?embed=1#complaints",
+  phones: "/customers?embed=1#phones", recordings: "/recordings?embed=1",
+};
+const LABEL = { open: "Open", in_progress: "In progress", resolved: "Resolved", closed: "Closed" };
+let current = null;
+
+function frameOf(view) {
+  const host = $("v-" + view);
+  let f = host.querySelector("iframe");
+  if (!f) { f = document.createElement("iframe"); f.src = PAGES[view]; host.append(f); }
+  return f;
+}
+
+// route: #overview | #customers | #complaints | #phones | #recordings | #recordings/call-12
+function go(hash) {
+  const [view, sub] = (hash || "#overview").replace(/^#/, "").split("/");
+  const v = TITLES[view] ? view : "overview";
+  document.querySelectorAll(".view").forEach(s => s.classList.remove("on"));
+  (v === "overview" ? $("overview") : $("v-" + v)).classList.add("on");
+  document.querySelectorAll("nav a").forEach(a => a.classList.toggle("on", a.dataset.view === v));
+  $("title").textContent = TITLES[v];
+  $("nav").classList.remove("open");
+  current = v;
+  if (v === "overview") loadOverview();
+  else {
+    const f = frameOf(v);
+    if (v === "recordings" && sub) {   // open one call
+      const target = PAGES.recordings + "#" + sub;
+      if (f.contentWindow && f.contentWindow.location.pathname === "/recordings") f.contentWindow.location.hash = sub;
+      else f.src = target;
+    }
+  }
+}
+// called by embedded pages ("Listen to the call" links)
+window.portalGo = (view, sub) => { location.hash = view + (sub ? "/" + sub : ""); };
+window.addEventListener("hashchange", () => go(location.hash));
+
+$("refresh").onclick = () => {
+  if (current === "overview") return loadOverview();
+  const f = $("v-" + current).querySelector("iframe");
+  if (f) f.contentWindow.location.reload();
+};
+$("menuBtn").onclick = () => $("nav").classList.toggle("open");
+
+// ---- overview -------------------------------------------------------------------
+async function j(url) { const r = await fetch(url); if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || r.statusText); return r.json(); }
+const day = iso => iso ? new Date(iso).toLocaleDateString([], { dateStyle: "medium" }) : "–";
+const when = iso => iso ? new Date(iso).toLocaleString([], { dateStyle: "medium", timeStyle: "short" }) : "–";
+const dur = s => s == null ? "" : `${Math.floor(s / 60)}:${String(Math.round(s % 60)).padStart(2, "0")}`;
+
+function card(label, value, sub, href) {
+  const c = el(href ? "a" : "div", "card");
+  if (href) c.href = href;
+  c.append(el("div", "k", label), el("div", "v", value));
+  if (sub instanceof Node) c.append(sub); else if (sub) c.append(el("div", "s", sub));
+  return c;
+}
+
+async function loadOverview() {
+  const o = $("overview"); o.innerHTML = "";
+  let customers, complaints, calls, phones;
+  try {
+    [customers, complaints, calls, phones] = await Promise.all([
+      j("/api/customers?limit=500"), j("/api/complaints?limit=6"), j("/api/calls?limit=200"),
+      j("/api/phones").catch(() => ({ items: [] })),
+    ]);
+  } catch (e) { o.append(el("p", "error", "Could not load: " + e.message)); return; }
+
+  const counts = complaints.counts || {};
+  const openTotal = (counts.open || 0) + (counts.in_progress || 0);
+  const pills = el("div", "pills");
+  for (const s of ["open", "in_progress", "resolved", "closed"]) if (counts[s]) pills.append(el("span", "pill s-" + s, `${LABEL[s]} ${counts[s]}`));
+  const today = new Date().toDateString();
+  const callsToday = calls.filter(c => new Date(c.started_at).toDateString() === today);
+  const online = phones.items.filter(p => p.state === "online").length;
+
+  const cards = el("div", "cards");
+  cards.append(
+    card("Calls today", callsToday.length, `${calls.length} recent in total`, "#recordings"),
+    card("Open complaints", openTotal, pills, "#complaints"),
+    card("Customers", customers.length, "registered callers", "#customers"),
+    card("Phones online", `${online}/${phones.items.length}`, "SIP logins registered now", "#phones"),
+  );
+  o.append(cards);
+
+  const cols = el("div", "cols");
+  const lc = el("div", "card list"); lc.append(el("h2", null, "Latest calls"));
+  if (!calls.length) lc.append(el("div", "empty", "No calls yet."));
+  for (const c of calls.slice(0, 6)) {
+    const it = el("div", "item");
+    it.append(el("div", "t", c.user_name || c.caller_number || "Unknown caller"), el("div", "m r", dur(c.duration_s)),
+              el("div", "m", (c.dialed_number === "web-chat" ? "web chat · " : "") + when(c.started_at)),
+              el("div", "m r", c.has_recording ? "🔊" : ""));
+    it.onclick = () => portalGo("recordings", "call-" + c.id);
+    lc.append(it);
+  }
+  const lt = el("div", "card list"); lt.append(el("h2", null, "Latest complaints"));
+  if (!complaints.items.length) lt.append(el("div", "empty", "No complaints yet."));
+  for (const t of complaints.items.slice(0, 6)) {
+    const it = el("div", "item");
+    const st = el("span", "pill s-" + t.status, LABEL[t.status] || t.status);
+    const r = el("div", "r"); r.append(st);
+    it.append(el("div", "t", `#${t.ticket_no} · ${(t.details.category || "complaint")}`), r,
+              el("div", "m", `${t.customer_name || "Guest"} · ${day(t.created_at)}`), el("div"));
+    it.onclick = () => portalGo("complaints");
+    lt.append(it);
+  }
+  cols.append(lc, lt);
+  o.append(cols);
+}
+
+go(location.hash);
+</script>
+
+<!-- ===== chat: floating button + slide-in panel (as on the standalone pages) ===== -->
+<style>
+  #chatFab { position: fixed; right: 20px; bottom: 20px; z-index: 50; border: none; border-radius: 999px;
+    padding: 12px 18px; background: var(--accent); color: #fff; font: 600 15px system-ui, sans-serif;
+    box-shadow: 0 4px 14px rgba(0,0,0,.18); cursor: pointer; }
+  #chatPanel { position: fixed; top: 0; right: 0; height: 100vh; height: 100dvh; width: min(440px, 100vw); z-index: 60;
+    background: var(--card); border-left: 1px solid var(--line); box-shadow: -6px 0 24px rgba(0,0,0,.12);
+    transform: translateX(100%); transition: transform .2s ease; display: flex; flex-direction: column; }
+  #chatPanel.open { transform: none; }
+  #chatPanel .bar { display: flex; align-items: center; justify-content: space-between; padding: 8px 12px; border-bottom: 1px solid var(--line); }
+  #chatPanel .bar b { font-size: 14px; }
+  #chatPanel .bar button { border: 1px solid var(--line); background: transparent; color: var(--text); border-radius: 8px; padding: 4px 10px; cursor: pointer; }
+  #chatPanel iframe { flex: 1; border: 0; width: 100%; background: var(--bg); }
+</style>
+<button id="chatFab" title="Chat with the assistant">💬 Chat</button>
+<aside id="chatPanel" aria-label="Assistant chat">
+  <div class="bar"><b>Assistant</b><button id="chatClose" title="Close (the chat keeps going)">✕</button></div>
+</aside>
+<script>
+(() => {
+  const panel = document.getElementById("chatPanel"), fab = document.getElementById("chatFab");
+  let frame = null;
+  fab.onclick = () => {
+    if (!frame) {   // load once; closing only hides it, so the conversation continues
+      frame = document.createElement("iframe");
+      frame.src = `${location.protocol}//${location.hostname}:8766/chat?embed=1`;
+      frame.allow = "microphone; autoplay";
+      panel.append(frame);
+    }
+    panel.classList.add("open"); fab.hidden = true;
+  };
+  document.getElementById("chatClose").onclick = () => { panel.classList.remove("open"); fab.hidden = false; };
+})();
+</script>
+</body>
+</html>

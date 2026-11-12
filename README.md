@@ -83,6 +83,19 @@ See [docs/DOCKER.md](docs/DOCKER.md) for:
 - phone testing and troubleshooting;
 - image sizes and the test results.
 
+### Admin portal (one page for everything)
+
+Open **http://127.0.0.1:8765/**. One portal with a left menu:
+- **Overview:** calls today, open complaints by status, customers, phones online, and the latest calls and complaints.
+- **Customers, Complaints, Phones, Calls & recordings.**
+- **💬 Chat:** the button at the bottom right slides in the assistant, available in every section; it keeps its conversation while you switch or close it.
+
+The old `/customers` and `/recordings` addresses still work on their own.
+
+### Voice chat in the browser (branch `webchat`)
+
+The same assistant in a web page: open **http://127.0.0.1:8766/chat**, then talk through the microphone or type. Everything works as on the phone: PIN on an on-screen keypad, complaints, ticket status, the knowledge base and web search. See [docs/WEBCHAT.md](docs/WEBCHAT.md).
+
 ## Configuration
 
 Everything is set in `.env`; [.env.example](.env.example) lists every option with comments. The ones you'll most likely change:

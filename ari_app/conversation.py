@@ -318,3 +318,63 @@ def split_tts_phrases(text: str, *, max_chars: int = 140) -> list[str]:
     if buf:
         chunks.append(buf)
     return chunks or [t[:max_chars]]
+
+
+def is_garbled(text: str) -> bool:
+    """
+    Whisper loops on noise ("पर पर पर पर…", "word word word…") or a phrase repeated many
+    times. Such a transcript is not something the caller said: ask them to repeat instead.
+    """
+    words = re.findall(r"\w+", (text or "").lower())
+    if len(words) < 6:
+        return False
+    from collections import Counter
+
+    counts = Counter(words)
+    top_word, top_n = counts.most_common(1)[0]
+    if top_n >= 5 and top_n / len(words) >= 0.4:
+        return True
+    # the same 2-3 word phrase repeated 4+ times
+    for n in (2, 3):
+        grams = Counter(tuple(words[i : i + n]) for i in range(len(words) - n + 1))
+        if grams and grams.most_common(1)[0][1] >= 4 and len(set(words)) <= max(6, len(words) // 3):
+            return True
+    return False
+
+
+# "Give me a moment while I check…" when the bot has nothing to check with: the caller
+# would wait for an answer that never comes. Small LLMs say this despite the prompt.
+_STALL = re.compile(
+    r"give me (just )?a (moment|second|minute|sec)|one (moment|second|minute)|hold on|bear with me|"
+    r"let me (just )?(check|look|find|see|pull|get)|while i (check|look|find|pull)|"
+    r"i'?ll (check|look into|look that up|find out|get back|confirm|verify)|"
+    r"i can (check|look up|look into|find out|verify) (that|this|it|on that|for you)|"
+    r"i can look (that|it|this) up|i can look up|i('?ll| will) look up|"
+    r"so (that )?i can (look|check|find|see|pull|verify|confirm)|look up (the |your )?(\w+ )?(details|information|policy|order|account)|"
+    r"check (the|our) (details|records|system|policy)|"
+    r"एक (मिनट|पल|सेकंड)|रुकिए|चेक कर(ती|ता|के)|देखकर बता(ती|ता|ऊँगी|ऊंगी)|पता करके",
+    re.IGNORECASE,
+)
+_HONEST_FALLBACK = {
+    "en": "I don't have that information right now, but I can register it as a request so our "
+    "team gets back to you. Would you like that?",
+    "hi": "यह जानकारी अभी मेरे पास नहीं है, लेकिन मैं इसे अनुरोध के रूप में दर्ज कर सकती हूँ ताकि "
+    "हमारी टीम आपसे संपर्क करे। क्या आप चाहेंगे?",
+}
+
+
+def remove_stalling(reply: str, *, has_facts: bool, lang: str = "en") -> tuple[str, bool]:
+    """
+    Drop sentences that promise a check the bot can't do. Returns (reply, changed).
+    With facts for this turn (RAG / web) the rest of the answer is kept; without facts a
+    stalling reply is replaced by an honest "I don't have that, shall I register it?".
+    """
+    text = (reply or "").strip()
+    if not text or not _STALL.search(text):
+        return text, False
+    sentences = re.split(r"(?<=[.!?।])\s+", text)
+    kept = [s for s in sentences if not _STALL.search(s)]
+    rest = " ".join(kept).strip()
+    if has_facts and len(rest.split()) >= 4:
+        return rest, True
+    return _HONEST_FALLBACK.get(lang, _HONEST_FALLBACK["en"]), True

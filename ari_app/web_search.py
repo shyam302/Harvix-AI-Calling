@@ -350,6 +350,24 @@ def build_search_query(user_text: str, *, max_len: int = 120) -> str:
 
     if _mentions_gold(raw):
         return "24 carat gold price per 10 gram india today INR live"[:max_len]
+    _ipl_team = re.search(
+        r"(gujarat titans?|mumbai indians?|chennai super kings?|royal challengers?|"
+        r"rajasthan royals?|sunrisers hyderabad|punjab kings?|delhi capitals?|"
+        r"kolkata knight riders?|lucknow super giants?|\b(rcb|csk|kkr|srh|pbks|lsg)\b)",
+        raw,
+        re.I,
+    )
+    if _CRICKET.search(raw) and not (re.search(r"\b(ipl|wpl)\b|आईपीएल", raw, re.I) or _ipl_team):
+        # International / other cricket (ODI, Test, T20I, India vs New Zealand…): search
+        # what was asked. The IPL templates below used to turn these into IPL queries.
+        cq = q
+        if not re.search(r"\bcricket\b", cq):
+            cq += " cricket"
+        if re.search(r"(next|upcoming|when|schedule|fixture|अगला|कब)", raw, re.I):
+            cq += " schedule"
+        if re.search(r"(score|live|result|won|स्कोर|लाइव)", raw, re.I):
+            cq += " live score"
+        return re.sub(r"\s+", " ", cq).strip()[:max_len]
     if _CRICKET.search(raw):
         when_match = re.search(
             r"\b(today|tonight|tomorrow|day after tomorrow|this week|weekend)\b|"
@@ -893,6 +911,83 @@ async def search_serpapi(
     )
 
 
+# ---- Google quota guard ----------------------------------------------------------------
+# Google Programmable Search: 100 free queries/day, reset at midnight US Pacific time.
+# Count every request we send (in Redis, so restarts don't reset it); at the limit, or for
+# 30 min after a 403/429 (bad key / API blocked / quota), use the free search instead.
+_google_paused_until = 0.0
+_google_local_count: dict[str, int] = {}
+
+
+def _google_day() -> str:
+    from datetime import datetime, timedelta, timezone
+
+    try:
+        from zoneinfo import ZoneInfo
+
+        now = datetime.now(ZoneInfo("America/Los_Angeles"))
+    except Exception:
+        now = datetime.now(timezone(timedelta(hours=-8)))
+    return now.strftime("%Y-%m-%d")
+
+
+def _google_limit() -> int:
+    import os
+
+    try:
+        return max(0, int(os.getenv("GOOGLE_DAILY_LIMIT", "100")))
+    except ValueError:
+        return 100
+
+
+async def _google_take_slot() -> tuple[bool, int]:
+    """Reserve one Google query for today. Returns (allowed, used_today)."""
+    import os
+
+    limit, day = _google_limit(), _google_day()
+    url = (os.getenv("REDIS_URL") or "").strip()
+    if url:
+        try:
+            import redis.asyncio as aioredis
+
+            r = aioredis.from_url(url, socket_connect_timeout=1, socket_timeout=1)
+            key = f"websearch:google:{day}"
+            used = int(await r.get(key) or 0)
+            if used >= limit:
+                await r.aclose()
+                return False, used
+            used = int(await r.incr(key))
+            await r.expire(key, 2 * 86400)
+            await r.aclose()
+            return used <= limit, used
+        except Exception as exc:  # Redis down: count in memory
+            log.debug("Google quota counter in Redis failed (%s); counting in memory", exc)
+    used = _google_local_count.get(day, 0)
+    if used >= limit:
+        return False, used
+    _google_local_count.clear()
+    _google_local_count[day] = used + 1
+    return True, used + 1
+
+
+async def google_usage() -> dict:
+    """For logs / health: queries used today and the limit."""
+    import os
+
+    day, used = _google_day(), _google_local_count.get(_google_day(), 0)
+    url = (os.getenv("REDIS_URL") or "").strip()
+    if url:
+        try:
+            import redis.asyncio as aioredis
+
+            r = aioredis.from_url(url, socket_connect_timeout=1, socket_timeout=1)
+            used = int(await r.get(f"websearch:google:{day}") or 0)
+            await r.aclose()
+        except Exception:
+            pass
+    return {"day_pacific": day, "used": used, "limit": _google_limit()}
+
+
 async def search_google(
     query: str,
     *,
@@ -907,6 +1002,14 @@ async def search_google(
     if not key or not engine_id:
         return []
 
+    global _google_paused_until
+    if time.monotonic() < _google_paused_until:
+        return []  # paused after an error: caller falls back to the free search
+    allowed, used = await _google_take_slot()
+    if not allowed:
+        log.info("Google daily limit reached (%s/%s); using the free search", used, _google_limit())
+        return []
+
     q = build_search_query(query)
     params = {
         "key": key,
@@ -919,6 +1022,18 @@ async def search_google(
     try:
         async with httpx.AsyncClient(timeout=timeout_seconds) as client:
             r = await client.get(_GOOGLE_CSE_URL, params=params)
+            if r.status_code in (400, 401, 403, 429):
+                try:
+                    msg = r.json().get("error", {}).get("message", "")[:160]
+                except ValueError:
+                    msg = r.text[:160]
+                _google_paused_until = time.monotonic() + 1800
+                log.warning(
+                    "Google search error %s (%s); using the free search for 30 min",
+                    r.status_code,
+                    msg,
+                )
+                return []
             r.raise_for_status()
             data: dict[str, Any] = r.json()
     except httpx.HTTPError as exc:
@@ -939,11 +1054,128 @@ async def search_google(
     topic = detect_search_topic(query)
     hits = _rank_hits(raw, topic=topic, limit=num_results)
     log.info(
-        "Google search %r topic=%s -> %s hits in %.2fs",
+        "Google search %r topic=%s -> %s hits in %.2fs (today %s/%s)",
         q[:50],
         topic,
         len(hits),
         time.perf_counter() - t0,
+        used,
+        _google_limit(),
+    )
+    return hits
+
+
+# ---- Tavily (https://tavily.com): search API built for AI assistants -------------------
+# Free plan: 1,000 credits/month (basic search = 1 credit). TAVILY_DAILY_LIMIT (default 30,
+# i.e. ~900/month) keeps the month's credits from running out early; at the limit or after
+# an error the free search is used. Counted per India day in Redis.
+_TAVILY_URL = "https://api.tavily.com/search"
+_tavily_paused_until = 0.0
+
+
+async def _take_daily_slot(name: str, limit: int, day: str) -> tuple[bool, int]:
+    """Reserve one paid-API query for ``day``. Returns (allowed, used). Redis, else memory."""
+    import os
+
+    url = (os.getenv("REDIS_URL") or "").strip()
+    if url:
+        try:
+            import redis.asyncio as aioredis
+
+            r = aioredis.from_url(url, socket_connect_timeout=1, socket_timeout=1)
+            key = f"websearch:{name}:{day}"
+            used = int(await r.get(key) or 0)
+            if used >= limit:
+                await r.aclose()
+                return False, used
+            used = int(await r.incr(key))
+            await r.expire(key, 2 * 86400)
+            await r.aclose()
+            return used <= limit, used
+        except Exception as exc:
+            log.debug("%s quota counter in Redis failed (%s); counting in memory", name, exc)
+    k = f"{name}:{day}"
+    used = _google_local_count.get(k, 0)
+    if used >= limit:
+        return False, used
+    _google_local_count[k] = used + 1
+    return True, used + 1
+
+
+def _tavily_limit() -> int:
+    import os
+
+    try:
+        return max(0, int(os.getenv("TAVILY_DAILY_LIMIT", "30")))
+    except ValueError:
+        return 30
+
+
+async def search_tavily(
+    query: str, *, api_key: str, num_results: int = 3, timeout_seconds: float = 8.0
+) -> list[SearchHit]:
+    """Tavily search: clean page text + a short direct answer (used as the first hit)."""
+    global _tavily_paused_until
+    key = (api_key or "").strip()
+    if not key or time.monotonic() < _tavily_paused_until:
+        return []
+    from datetime import datetime, timedelta, timezone
+
+    day = datetime.now(timezone(timedelta(hours=5, minutes=30))).strftime("%Y-%m-%d")
+    limit = _tavily_limit()
+    allowed, used = await _take_daily_slot("tavily", limit if limit > 0 else 10**9, day)
+    if not allowed:
+        log.info("Tavily daily limit reached (%s/%s); using the free search", used, _tavily_limit())
+        return []
+    q = build_search_query(query)
+    body = {
+        "query": q,
+        "search_depth": "basic",          # 1 credit
+        "max_results": max(1, min(num_results, 5)),
+        "include_answer": True,
+        "topic": "news" if detect_search_topic(query) == "news" else "general",
+    }
+    t0 = time.perf_counter()
+    try:
+        async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+            r = await client.post(
+                _TAVILY_URL, json=body, headers={"Authorization": f"Bearer {key}"}
+            )
+            if r.status_code in (400, 401, 403, 429, 432, 433):
+                _tavily_paused_until = time.monotonic() + 1800
+                log.warning(
+                    "Tavily error %s (%s); using the free search for 30 min",
+                    r.status_code,
+                    r.text[:160],
+                )
+                return []
+            r.raise_for_status()
+            data: dict[str, Any] = r.json()
+    except httpx.HTTPError as exc:
+        log.warning("Tavily search failed for %r: %s", q[:60], exc)
+        return []
+    raw: list[SearchHit] = []
+    answer = (data.get("answer") or "").strip()
+    if answer:
+        raw.append(SearchHit(title="Answer", snippet=answer, link=""))
+    for item in data.get("results") or []:
+        if isinstance(item, dict) and (item.get("content") or item.get("title")):
+            raw.append(
+                SearchHit(
+                    title=(item.get("title") or "").strip(),
+                    snippet=(item.get("content") or "").strip()[:600],
+                    link=(item.get("url") or "").strip(),
+                )
+            )
+    hits = raw[: num_results + 1]  # Tavily already ranks; keep its answer + top results
+    log.info(
+        "Tavily search %r -> %s hits%s in %.2fs (today %s/%s)",
+        q[:50],
+        len(hits),
+        " (with answer)" if answer else "",
+        time.perf_counter() - t0,
+        used,
+        _tavily_limit() or "unlimited",
     )
     return hits
 
@@ -962,7 +1194,8 @@ async def search_web(
     """
     Run web search.
 
-    provider: fast | auto | crawl | serpapi | google | duckduckgo
+    provider: fast | tavily | auto | crawl | serpapi | google | duckduckgo
+    tavily = Tavily API (answer + clean text), daily-limited, then fast.
     fast = DuckDuckGo/multi-engine snippets only (~1 s).
     crawl = duckduckgo-search + crawl4ai (Playwright) + BeautifulSoup + LangChain
     auto = crawl first, then SerpAPI / Google CSE / DuckDuckGo snippets.
@@ -972,6 +1205,20 @@ async def search_web(
     if topic == "general" and _mentions_gold(query):
         topic = "gold"
     built_q = build_search_query(query)
+
+    if prov == "tavily":
+        import os
+
+        hits = await search_tavily(
+            query,
+            api_key=os.getenv("TAVILY_API_KEY", ""),
+            num_results=num_results,
+            timeout_seconds=timeout_seconds,
+        )
+        if hits:
+            return hits, built_q
+        log.info("Tavily returned nothing (limit, error or no results); using the free search")
+        prov = "fast"
 
     if prov == "fast":
         # Snippets only: the page crawl also starts from these engines, so when
